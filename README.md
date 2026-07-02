@@ -33,7 +33,7 @@ Requirements: Docker with compose, host networking available (mDNS/PTP),
 a UPnP/DLNA renderer on the same LAN.
 
 ```bash
-git clone https://github.com/Jakobas/airplay2-dlna-bridge
+git clone https://github.com/shinn-y/airplay2-dlna-bridge
 cd airplay2-dlna-bridge
 cp .env.example .env      # edit HOST_IP and RENDERER_IP(WiiM)
 docker compose up -d --build
