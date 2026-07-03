@@ -67,6 +67,19 @@ Expect ~4–6 s of end-to-end latency (AirPlay 2 clock + the renderer's own HTTP
 prebuffer). This is inherent to the double-buffered chain; volume and
 play/pause react much faster.
 
+## Multiroom
+
+**Do not group this bridge with real AirPlay 2 speakers** — the renderer's HTTP
+prebuffer is seconds long, varies per connection, and drifts (its DAC clock is
+not disciplined to the AirPlay PTP timeline), so the rooms will be seconds
+apart with no way to correct it. This is a protocol-level limitation of any
+re-streaming bridge.
+
+Multiroom among LinkPlay devices works fine the other way around: group your
+other WiiM/LinkPlay speakers behind the renderer in the WiiM Home app (firmware
+handles tight sync between them), and AirPlay to the bridge as a single
+endpoint.
+
 ## Credits
 
 - [shairport-sync](https://github.com/mikebrady/shairport-sync) does all the
