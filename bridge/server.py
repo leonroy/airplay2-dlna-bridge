@@ -77,7 +77,21 @@ class Ring:
 
 RING = Ring()
 NOW_PLAYING = {"title": "", "artist": "", "album": "", "artwork": ""}
-ART = {"id": 0, "bytes": b"", "hash": None, "mime": "image/jpeg"}
+# seed the artwork id from the clock so /art-<id>.jpg URLs never repeat across
+# restarts: a renderer that cached art-1.jpg from a previous run would otherwise
+# show that stale cover for the first track instead of re-fetching the new one
+ART = {"id": int(time.time()), "bytes": b"", "hash": None, "mime": "image/jpeg"}
+# recent artworks kept by id: a renderer lagging behind rapid track changes may
+# fetch an older /art-<id>.jpg after ART has moved on - serve THAT push's image,
+# not whatever is current, so it never caches the wrong cover for a track
+ART_CACHE = {}
+ART_CACHE_MAX = 16
+
+
+def cache_art(art_id, data, mime):
+    ART_CACHE[art_id] = (data, mime)
+    while len(ART_CACHE) > ART_CACHE_MAX:
+        del ART_CACHE[min(ART_CACHE)]
 # WiiM's display only reads DIDL (it ignores ICY), so a track change needs a
 # SetAVTransportURI push; the player restarts the stream on it (~2-4s gap).
 DIDL_PUSH = os.environ.get("DIDL_PUSH", "1") == "1"
@@ -125,12 +139,14 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def serve_art(self):
-        data = ART["bytes"]
+        m = re.search(r"/art-(\d+)", self.path)
+        entry = ART_CACHE.get(int(m.group(1))) if m else None
+        data, mime = entry if entry else (ART["bytes"], ART["mime"])
         if not data:
             self.send_error(404)
             return
         self.send_response(200)
-        self.send_header("Content-Type", ART["mime"])
+        self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -373,6 +389,7 @@ def handle_copl(data):
         if h != ART["hash"]:
             ART.update(id=ART["id"] + 1, bytes=art, hash=h,
                        mime=mime if isinstance(mime, str) and mime else "image/jpeg")
+            cache_art(ART["id"], art, ART["mime"])
             NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
                 STREAM_URL.rsplit("/", 1)[0], ART["id"])
             STATE["dirty"] = time.time()
@@ -452,6 +469,7 @@ def metadata_reader(wiim):
                             h = hash(data)
                             if h != ART["hash"]:
                                 ART.update(id=ART["id"] + 1, bytes=data, hash=h)
+                                cache_art(ART["id"], data, ART["mime"])
                                 NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
                                     STREAM_URL.rsplit("/", 1)[0], ART["id"])
                                 STATE["dirty"] = time.time()
@@ -471,12 +489,18 @@ def metadata_reader(wiim):
                             drop_clients("seek/pause" if code == "pfls" else "pause")
                         elif typ == "ssnc" and code == "pbeg" and not STATE["active"]:
                             RING.mark_session()
+                            # clear any stale now-playing/artwork left by a previous
+                            # session so a reconnect never pushes old metadata or art
+                            pending.clear()
+                            NOW_PLAYING.update(title="", artist="", album="", artwork="")
+                            ART.update(bytes=b"", hash=None)
                             log("session begin")
                             # let the first metadata land, then didl_pusher starts playback
                             STATE.update(active=True, pushed=None, dirty=time.time())
                         elif typ == "ssnc" and code == "pend":
                             pending.clear()
                             NOW_PLAYING.update(title="", artist="", album="", artwork="")
+                            ART.update(bytes=b"", hash=None)
                             STATE.update(active=False, dirty=0.0, pushed=None)
                             log("session end")
                             wiim.stop()
