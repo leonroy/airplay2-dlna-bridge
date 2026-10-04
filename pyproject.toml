@@ -9,7 +9,6 @@ allow_zero_version = true
 major_on_zero = true
 tag_format = "v{version}"
 commit_parser = "conventional"
-assets = ["CHANGELOG.md"]
 
 [tool.semantic_release.branches.main]
 match = "^main$"
@@ -21,13 +20,6 @@ patch_tags = ["fix", "perf", "build", "chore", "ci", "docs", "style", "refactor"
 other_allowed_tags = []
 allowed_tags = ["feat", "fix", "perf", "build", "chore", "ci", "docs", "style", "refactor", "test", "revert"]
 parse_squash_commits = false
-
-[tool.semantic_release.changelog]
-exclude_commit_patterns = ["^chore\\(release\\):"]
-
-[tool.semantic_release.changelog.default_templates]
-changelog_file = "CHANGELOG.md"
-mask_initial_release = false
 
 [tool.semantic_release.remote]
 name = "origin"
