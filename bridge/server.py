@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """AirPlay 2 -> UPnP/DLNA renderer bridge:
-- raw PCM (s16le/44100/2) from the shairport-sync pipe goes into a ring buffer
+- raw PCM from shairport-sync is described by its ssnc/odsc metadata
+  and normalised to little-endian PCM before entering the ring buffer
   (a slow/stalled player can never back-pressure shairport into dropping audio)
 - /stream.flac : per-client ffmpeg encodes PCM->FLAC from the join point,
   served with ICY metadata
@@ -8,7 +9,7 @@
 - the shairport metadata pipe drives UPnP Play/Stop, hardware volume, and
   now-playing DIDL pushes on the renderer
 """
-import base64, os, plistlib, re, socket, struct, subprocess, threading, time, urllib.request
+import base64, collections, os, plistlib, re, select, socket, struct, subprocess, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 
@@ -20,28 +21,138 @@ RENDERER_IP = os.environ.get("RENDERER_IP") or os.environ.get("WIIM_IP", "")
 MAX_VOLUME = int(os.environ.get("MAX_VOLUME", "100"))
 
 ICY_META_INT = 131072               # same interval airupnp uses
-RING_MAX = 2 * 1024 * 1024          # ~11s of 44100/16/2 PCM
-CLIENT_BACKLOG = 256 * 1024         # ~1.5s handed out instantly to fill the player prebuffer
-FRAME = 4                           # bytes per PCM frame
+RING_SECONDS = 12
+BACKLOG_SECONDS = 1.5
+PENDING_MAX = 4 * 1024 * 1024       # bound audio waiting for output-description metadata
+
+
+class PCMFormat(collections.namedtuple("PCMFormatBase", "rate format channels")):
+    """Validated Shairport pipe format; storage width can differ from bit depth."""
+    __slots__ = ()
+    FORMATS = {
+        "S8": (1, 8, "little"), "U8": (1, 8, "little"),
+        "S16_LE": (2, 16, "little"), "S16_BE": (2, 16, "big"),
+        "S24_LE": (4, 24, "little"), "S24_BE": (4, 24, "big"),
+        "S24_3LE": (3, 24, "little"), "S24_3BE": (3, 24, "big"),
+        "S32_LE": (4, 32, "little"), "S32_BE": (4, 32, "big"),
+    }
+    RATES = frozenset((5512, 8000, 11025, 16000, 22050, 32000, 44100,
+                       48000, 64000, 88200, 96000, 176400, 192000, 352800, 384000))
+
+    def __new__(cls, rate, format, channels):
+        if type(rate) is not int or rate not in cls.RATES:
+            raise ValueError("unsupported output sample rate")
+        if not isinstance(format, str) or format not in cls.FORMATS:
+            raise ValueError("unsupported output sample format")
+        # odsc supplies no channel layout. Keep the renderer bridge mono/stereo.
+        if type(channels) is not int or channels not in (1, 2):
+            raise ValueError("output must be mono or stereo")
+        return super().__new__(cls, rate, format, channels)
+
+    @classmethod
+    def from_description(cls, data):
+        try:
+            description = data.decode("ascii") if isinstance(data, bytes) else data
+            match = re.fullmatch(r"([0-9]{4,6})/([A-Z0-9_]{2,12})/([1-8])", description)
+            if match is None:
+                raise ValueError("expected rate/format/channels in odsc")
+            return cls(int(match[1]), match[2], int(match[3]))
+        except (UnicodeError, TypeError):
+            raise ValueError("expected ASCII rate/format/channels in odsc") from None
+
+    @property
+    def bits(self):
+        return self.FORMATS[self.format][1]
+
+    @property
+    def description(self):
+        return f"{self.rate}/{self.format}/{self.channels}"
+
+    @property
+    def source_frame(self):
+        return self.FORMATS[self.format][0] * self.channels
+
+    @property
+    def frame(self):
+        return self.bits // 8 * self.channels
+
+    @property
+    def ffmpeg_format(self):
+        return "u8" if self.bits == 8 else f"s{self.bits}le"
+
+    def normalise(self, data):
+        """Accept complete source frames; produce packed PCM suitable for WAV."""
+        if len(data) % self.source_frame:
+            raise ValueError("incomplete PCM frame")
+        storage, bits, byte_order = self.FORMATS[self.format]
+        if self.format == "S8":
+            return bytes(value ^ 128 for value in data)
+        if bits == 24 and storage == 4:
+            if byte_order == "little":
+                return b"".join(data[i:i + 3] for i in range(0, len(data), 4))
+            return b"".join(data[i + 1:i + 4][::-1] for i in range(0, len(data), 4))
+        if byte_order == "big":
+            return b"".join(data[i:i + storage][::-1] for i in range(0, len(data), storage))
+        return data
+
+    def encoder_command(self):
+        bits = max(16, self.bits)  # FLAC stores 8-bit input losslessly as 16-bit samples.
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                   "-f", self.ffmpeg_format, "-ar", str(self.rate),
+                   "-ac", str(self.channels), "-i", "pipe:0",
+                   "-c:a", "flac", "-sample_fmt", "s16" if bits == 16 else "s32",
+                   "-bits_per_raw_sample", str(bits)]
+        if bits == 32:
+            # FFmpeg otherwise silently truncates 32-bit input to 24-bit FLAC.
+            command += ["-strict", "experimental"]
+        return command + ["-compression_level", "0", "-flush_packets", "1",
+                          "-f", "flac", "pipe:1"]
+
+    def wav_header(self):
+        return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+                + b"fmt " + struct.pack("<IHHIIHH", 16, 1, self.channels, self.rate,
+                                       self.rate * self.frame, self.frame, self.bits)
+                + b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+
+class StreamEnded(Exception):
+    """A reader must reconnect rather than consume a different session's PCM."""
 
 
 def log(msg):
-    print(f"[bridge] {msg}", flush=True)
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+    print(f"[bridge] {stamp}.{int(now % 1 * 1000):03d}Z {msg}", flush=True)
+
+
+def description_for_log(data):
+    """Bound and escape format descriptions, including malformed payloads."""
+    if isinstance(data, (bytes, str)):
+        return f"{data[:96]!r} length={len(data)}"
+    return f"<{type(data).__name__}>"
 
 
 class Ring:
-    def __init__(self):
+    def __init__(self, pcm, session_id=None):
+        self.pcm = pcm
+        self.session_id = session_id
+        self.frame = pcm.frame
+        self.capacity = pcm.rate * RING_SECONDS * self.frame
+        self.backlog = int(pcm.rate * BACKLOG_SECONDS) * self.frame
         self.buf = bytearray()
         self.head = 0               # absolute offset of buf[0]
         self.session_start = 0      # absolute offset where the current session began
         self.cond = threading.Condition()
+        self.closed = False
 
     def write(self, data):
         with self.cond:
+            if self.closed:
+                return
             self.buf += data
-            if len(self.buf) > RING_MAX:
-                cut = len(self.buf) - RING_MAX
-                cut -= cut % FRAME
+            if len(self.buf) > self.capacity:
+                cut = len(self.buf) - self.capacity
+                cut -= cut % self.frame
                 del self.buf[:cut]
                 self.head += cut
             self.cond.notify_all()
@@ -57,25 +168,232 @@ class Ring:
     def join_pos(self):
         with self.cond:
             end = self.head + len(self.buf)
-            pos = max(self.session_start, self.head, end - CLIENT_BACKLOG)
-            return pos + (-pos) % FRAME
+            pos = max(self.session_start, self.head, end - self.backlog)
+            return pos + (-pos) % self.frame
+
+    def close(self):
+        with self.cond:
+            self.closed = True
+            self.cond.notify_all()
 
     def read_from(self, pos, timeout=5):
         """return (newpos, bytes) at absolute pos, waiting for data if at the end"""
         with self.cond:
+            if self.closed:
+                raise StreamEnded()
             end = self.head + len(self.buf)
             if pos >= end:
                 self.cond.wait(timeout)
+                if self.closed:
+                    raise StreamEnded()
                 end = self.head + len(self.buf)
                 if pos >= end:
                     return pos, b""
             if pos < self.head:     # fell behind: jump near the live edge
-                pos = max(self.head, end - CLIENT_BACKLOG)
-                pos += (-pos) % FRAME
+                pos = max(self.head, end - self.backlog)
+                pos += (-pos) % self.frame
             return end, bytes(self.buf[pos - self.head:])
 
 
-RING = Ring()
+class AudioStream:
+    """Serialise format announcements, raw input, and playback session changes."""
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.ring = None
+        self.pcm = None
+        self.pending = bytearray()
+        self.active = False
+        self.failed = False
+        self.accepting = True      # allow first-session audio to precede metadata
+        self.audio_fd = None
+        self.audio_generation = None
+        self.eof_generation = None
+        self.drain_on_attach = False
+        self.idle_bytes = 0
+        self.session_counter = 0
+        self.session_id = None
+        self.started = None
+        self.first_audio = None
+        self.wait_logged = None
+        self.raw_bytes = self.pcm_bytes = self.discarded_bytes = self.odsc_count = 0
+
+    def _ensure_session(self):
+        # A local ID, not an ID supplied by Shairport. Audio/odsc may precede pbeg.
+        if self.session_id is None:
+            if self.idle_bytes:
+                log(f"audio discarded between sessions bytes={self.idle_bytes}")
+                self.idle_bytes = 0
+            self.session_counter += 1
+            self.session_id = self.session_counter
+            self.started = time.monotonic()
+
+    def status(self):
+        with self.lock:
+            age = int((time.monotonic() - self.started) * 1000) if self.started is not None else 0
+            pcm = self.pcm.description if self.pcm else "unknown"
+            return (f"session={self.session_id or 'none'} active={self.active} failed={self.failed} "
+                    f"pcm={pcm} odsc_count={self.odsc_count} age_ms={age} "
+                    f"raw_bytes={self.raw_bytes} pcm_bytes={self.pcm_bytes} "
+                    f"pending_bytes={len(self.pending)} discarded_bytes={self.discarded_bytes}")
+
+    def begin(self):
+        with self.lock:
+            self._ensure_session()
+            self.accepting = True
+            self.active = True
+            # odsc can arrive before pbeg: the player thread is started first.
+            log(f"pbeg received; {'format ready' if self.pcm else 'waiting for odsc'}; {self.status()}")
+
+    def _drain_audio(self):
+        """Discard the ended writer's queued bytes, under the same lock as reads."""
+        if self.audio_fd is None:
+            # A completed EOF already establishes that this session was drained.
+            self.drain_on_attach = self.session_id != self.eof_generation
+            return
+        drained = 0
+        while True:
+            try:
+                data = os.read(self.audio_fd, 65536)
+            except BlockingIOError:
+                break
+            if not data:
+                self.eof_generation = self.session_id
+                break
+            drained += len(data)
+        self.drain_on_attach = False
+        if drained:
+            log(f"drained queued audio at session boundary bytes={drained}; {self.status()}")
+
+    def attach_audio(self, fd):
+        with self.lock:
+            os.set_blocking(fd, False)
+            self.audio_fd = fd
+            self.audio_generation = None
+            if self.drain_on_attach:
+                self._drain_audio()
+
+    def detach_audio(self, fd):
+        with self.lock:
+            if self.audio_fd == fd:
+                self.audio_fd = None
+
+    def read_audio(self, fd):
+        with self.lock:
+            # Read and feed atomically: no read can straddle pend's drain/reset.
+            try:
+                data = os.read(fd, 8192)
+            except BlockingIOError:
+                return None, self.audio_generation
+            if data:
+                self.eof_generation = None
+                accepting = self.accepting
+                self.feed(data)
+                if accepting:
+                    self.audio_generation = self.session_id
+            else:
+                self.eof_generation = self.audio_generation
+            return data, self.audio_generation
+
+    def end(self, reason="pend", *, drain=True):
+        with self.lock:
+            self.accepting = False
+            if drain:
+                # Shairport emits pend after the old player has stopped writing.
+                self._drain_audio()
+            log(f"session ended reason={reason}; {self.status()}")
+            if self.ring is not None:
+                self.ring.close()
+            self.ring = self.pcm = None
+            self.pending.clear()
+            self.active = self.failed = False
+            self.session_id = self.started = self.first_audio = self.wait_logged = None
+            self.raw_bytes = self.pcm_bytes = self.discarded_bytes = self.odsc_count = 0
+            self.idle_bytes = 0
+
+    def fail(self, reason="invalid output description"):
+        with self.lock:
+            self._ensure_session()
+            if not self.failed:
+                log(f"audio session rejected reason={reason}; {self.status()}")
+            if self.ring is not None:
+                self.ring.close()
+            self.ring = self.pcm = None
+            self.discarded_bytes += len(self.pending)
+            self.pending.clear()
+            self.failed = True
+
+    def describe(self, data):
+        with self.lock:
+            self._ensure_session()
+            self.odsc_count += 1
+            log(f"odsc received value={description_for_log(data)}; {self.status()}")
+            pcm = PCMFormat.from_description(data)
+            if self.failed:
+                raise ValueError("audio session rejected; start a new playback session")
+            if self.pcm is not None:
+                if pcm == self.pcm:
+                    log(f"odsc unchanged; {self.status()}")
+                    return False
+                # There is no byte offset in odsc: never relabel already buffered audio.
+                self.fail(f"output format changed {self.pcm.description} -> {pcm.description} "
+                          "without pend/pbeg boundary")
+                raise ValueError("output format changed during playback; start a new session")
+            self.pcm = pcm
+            self.accepting = True
+            self.ring = Ring(pcm, self.session_id)
+            buffered = len(self.pending)
+            self._write_pending()
+            delay = (f"{int((time.monotonic() - self.first_audio) * 1000)}ms after first audio"
+                     if self.first_audio is not None else "before first audio")
+            log(f"odsc accepted source={pcm.description} normalised={pcm.ffmpeg_format} "
+                f"source_bytes_per_frame={pcm.source_frame} pcm_bytes_per_frame={pcm.frame} "
+                f"ring_bytes={self.ring.capacity} backlog_bytes={self.ring.backlog} "
+                f"buffered_before_odsc={buffered} odsc_timing={delay}; {self.status()}")
+            return True
+
+    def feed(self, data):
+        with self.lock:
+            if not data:
+                return
+            if not self.accepting:
+                # Between pend and the next metadata, bytes still belong to the old session.
+                self.idle_bytes += len(data)
+                if self.idle_bytes == len(data):
+                    log(f"discarding audio between sessions chunk_bytes={len(data)}; {self.status()}")
+                return
+            self._ensure_session()
+            self.raw_bytes += len(data)
+            if self.first_audio is None:
+                self.first_audio = time.monotonic()
+                log(f"first audio received chunk_bytes={len(data)}; {self.status()}")
+            if self.failed:
+                self.discarded_bytes += len(data)
+                return
+            self.pending.extend(data)
+            if self.pcm is None:
+                now = time.monotonic()
+                if len(self.pending) > PENDING_MAX:
+                    self.fail(f"odsc missing or delayed; pending-buffer limit={PENDING_MAX} exceeded")
+                elif self.wait_logged is None or now - self.wait_logged >= 5:
+                    log(f"audio waiting for odsc; pending_limit={PENDING_MAX}; {self.status()}")
+                    self.wait_logged = now
+                return
+            self._write_pending()
+
+    def _write_pending(self):
+        complete = len(self.pending) // self.pcm.source_frame * self.pcm.source_frame
+        if complete:
+            normalised = self.pcm.normalise(bytes(self.pending[:complete]))
+            self.ring.write(normalised)
+            self.pcm_bytes += len(normalised)
+            del self.pending[:complete]
+
+    def snapshot(self):
+        with self.lock:
+            return self.ring if self.active and not self.failed else None
+
+
+AUDIO = AudioStream()
 NOW_PLAYING = {"title": "", "artist": "", "album": "", "artwork": ""}
 # seed the artwork id from the clock so /art-<id>.jpg URLs never repeat across
 # restarts: a renderer that cached art-1.jpg from a previous run would otherwise
@@ -104,7 +422,9 @@ CLIENTS = set()          # sockets of connected stream clients
 
 
 def drop_clients(reason):
-    RING.mark_session()
+    ring = AUDIO.snapshot()
+    if ring is not None:
+        ring.mark_session()
     n = 0
     for s in list(CLIENTS):
         try:
@@ -116,10 +436,8 @@ def drop_clients(reason):
         log(f"{reason}: dropped {n} client(s) to resync")
 
 
-def wav_header():
-    return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
-            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16)
-            + b"data" + struct.pack("<I", 0xFFFFFFFF))
+def wav_header(pcm):
+    return pcm.wav_header()
 
 
 class StreamHandler(BaseHTTPRequestHandler):
@@ -153,26 +471,36 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     # ---- diagnostic endpoint: pure PCM in a WAV container, never any ICY ----
     def serve_wav(self):
+        ring = AUDIO.snapshot()
+        if ring is None:
+            log(f"wav request rejected HTTP=503; {AUDIO.status()}")
+            self.send_error(503, "Waiting for a valid Shairport output description")
+            return
         self.connection.settimeout(30)
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.end_headers()
-        log(f"wav client {self.address_string()} connected")
-        pos = RING.join_pos()
+        log(f"wav client {self.address_string()} connected session={ring.session_id} pcm={ring.pcm.description}")
+        pos = ring.join_pos()
         CLIENTS.add(self.connection)
         try:
-            self.wfile.write(wav_header())
+            self.wfile.write(wav_header(ring.pcm))
             while True:
-                pos, data = RING.read_from(pos)
+                pos, data = ring.read_from(pos)
                 if data:
                     self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
-            log(f"wav client {self.address_string()} disconnected")
+        except (StreamEnded, BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
+            log(f"wav client {self.address_string()} disconnected session={ring.session_id} ring_closed={ring.closed}")
         finally:
             CLIENTS.discard(self.connection)
 
     # ---- main endpoint: FLAC + ICY, the combo airupnp uses on the WiiM ----
     def serve_flac(self):
+        ring = AUDIO.snapshot()
+        if ring is None:
+            log(f"flac request rejected HTTP=503; {AUDIO.status()}")
+            self.send_error(503, "Waiting for a valid Shairport output description")
+            return
         icy = self.headers.get("Icy-MetaData") == "1"
         self.connection.settimeout(30)
         self.send_response(200)
@@ -181,28 +509,31 @@ class StreamHandler(BaseHTTPRequestHandler):
         if icy:
             self.send_header("icy-metaint", str(ICY_META_INT))
         self.end_headers()
-        log(f"flac client {self.address_string()} connected (icy={icy})")
+        log(f"flac client {self.address_string()} connected (icy={icy}) "
+            f"session={ring.session_id} pcm={ring.pcm.description}")
 
         enc = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
-             "-c:a", "flac", "-compression_level", "0", "-flush_packets", "1",
-             "-f", "flac", "pipe:1"],
+            ring.pcm.encoder_command(),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
         CLIENTS.add(self.connection)
         stop = threading.Event()
 
         def feeder():
-            pos = RING.join_pos()
+            pos = ring.join_pos()
             try:
                 while not stop.is_set():
-                    pos, data = RING.read_from(pos)
+                    pos, data = ring.read_from(pos)
                     if data:
                         enc.stdin.write(data)
                         enc.stdin.flush()
-            except (BrokenPipeError, OSError):
+            except (StreamEnded, BrokenPipeError, OSError):
                 pass
+            finally:
+                try:
+                    enc.stdin.close()
+                except OSError:
+                    pass
 
         threading.Thread(target=feeder, daemon=True).start()
 
@@ -225,11 +556,19 @@ class StreamHandler(BaseHTTPRequestHandler):
                         self.wfile.write(block)
                         sent_since_meta = 0
         except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
-            log(f"flac client {self.address_string()} disconnected")
+            log(f"flac client {self.address_string()} disconnected session={ring.session_id}")
         finally:
             CLIENTS.discard(self.connection)
             stop.set()
-            enc.kill()
+            result = enc.poll()
+            if result is not None and result != 0:
+                log(f"flac encoder failed exit={result} session={ring.session_id} pcm={ring.pcm.description}")
+            log(f"flac stream closed session={ring.session_id} ring_closed={ring.closed}")
+            try:
+                enc.kill()
+            except OSError:
+                pass
+            enc.wait()
 
     @staticmethod
     def icy_block(last):
@@ -246,29 +585,48 @@ class StreamHandler(BaseHTTPRequestHandler):
         return bytes([(len(raw) + pad) // 16]) + raw + b"\x00" * pad, cur
 
 
+def handle_audio_eof(generation):
+    with AUDIO.lock:
+        if generation is None or generation != AUDIO.session_id:
+            log(f"audio EOF ignored ended_generation={generation}; {AUDIO.status()}")
+            return False
+        AUDIO.end("audio pipe EOF", drain=False)
+        STATE.update(active=False, dirty=0.0, pushed=None)
+        drop_clients("audio pipe closed")
+        return True
+
+
 def audio_reader(wiim):
     last = 0.0
     while True:
         try:
             # unbuffered: a fifo read must return whatever is available
+            log(f"waiting for audio pipe writer path={AUDIO_PIPE}; {AUDIO.status()}")
             with open(AUDIO_PIPE, "rb", buffering=0) as f:
-                log("audio pipe open")
-                while True:
-                    data = f.read(8192)
-                    if not data:
-                        break
-                    now = time.time()
-                    # audio resumed after a pause: clients were dropped, so kick
-                    # the player to reconnect right away instead of on its retry
-                    if last and now - last > 2 and STATE["active"] and not CLIENTS:
-                        log("audio resumed, kicking player")
-                        threading.Thread(target=wiim.action, daemon=True,
-                                         args=("Play", "<Speed>1</Speed>")).start()
-                    last = now
-                    RING.write(data)
-            log("audio pipe closed (session ended)")
+                log(f"audio pipe open; {AUDIO.status()}")
+                fd = f.fileno()
+                AUDIO.attach_audio(fd)
+                try:
+                    while True:
+                        select.select([fd], [], [])
+                        data, generation = AUDIO.read_audio(fd)
+                        if data is None:
+                            continue
+                        if not data:
+                            break
+                        now = time.time()
+                        # Only resume a player with a valid output description.
+                        if (last and now - last > 2 and STATE["active"] and not CLIENTS
+                                and AUDIO.snapshot() is not None):
+                            log(f"audio resumed, kicking player; {AUDIO.status()}")
+                            threading.Thread(target=wiim.action, daemon=True,
+                                             args=("Play", "<Speed>1</Speed>")).start()
+                        last = now
+                finally:
+                    AUDIO.detach_audio(fd)
+            handle_audio_eof(generation)
         except Exception as e:
-            log(f"audio pipe error: {e}")
+            log(f"audio pipe error: {e}; {AUDIO.status()}")
             time.sleep(1)
 
 
@@ -410,12 +768,53 @@ ITEM = re.compile(
     re.S)
 
 
+def handle_output_description(data, wiim):
+    try:
+        changed = AUDIO.describe(data)
+    except ValueError as error:
+        AUDIO.fail(str(error))
+        drop_clients("invalid output description")
+        log(f"odsc rejected: {error}; stopping renderer; {AUDIO.status()}")
+        wiim.stop()
+        return
+    if changed:
+        STATE.update(pushed=None, dirty=time.time())
+
+
+def handle_playback_metadata(code, data, wiim, pending):
+    """Handle the real metadata events as well as direct unit-test sequences."""
+    if code == "odsc":
+        handle_output_description(data, wiim)
+    elif code == "pbeg":
+        with AUDIO.lock:
+            if not STATE["active"]:
+                AUDIO.begin()
+                pending.clear()
+                NOW_PLAYING.update(title="", artist="", album="", artwork="")
+                ART.update(bytes=b"", hash=None)
+                STATE.update(active=True, pushed=None, dirty=time.time())
+            else:
+                log(f"duplicate pbeg ignored; {AUDIO.status()}")
+    elif code == "pend":
+        with AUDIO.lock:
+            AUDIO.end("pend received")
+            drop_clients("session end")
+            pending.clear()
+            NOW_PLAYING.update(title="", artist="", album="", artwork="")
+            ART.update(bytes=b"", hash=None)
+            STATE.update(active=False, dirty=0.0, pushed=None)
+        wiim.stop()
+    else:
+        return False
+    return True
+
+
 def didl_pusher(wiim):
     """single place that talks to the renderer transport: initial play and (debounced)
     track-change DIDL refreshes; the player restarts the stream on each push"""
     while True:
         time.sleep(0.5)
-        if not STATE["active"] or not STATE["dirty"]:
+        if not STATE["active"] or not STATE["dirty"] or AUDIO.snapshot() is None:
             continue
         if time.time() - STATE["dirty"] < PUSH_SETTLE:
             continue
@@ -432,11 +831,14 @@ def didl_pusher(wiim):
 def metadata_reader(wiim):
     threading.Thread(target=didl_pusher, args=(wiim,), daemon=True).start()
     pending = {}
+    sequence = 0
 
     while True:
         try:
             # unbuffered: small metadata items must not wait for a full buffer
+            log(f"waiting for metadata pipe writer path={META_PIPE}; {AUDIO.status()}")
             with open(META_PIPE, "rb", buffering=0) as f:
+                log(f"metadata pipe open; {AUDIO.status()}")
                 buf = b""
                 while True:
                     chunk = f.read(4096)
@@ -451,7 +853,13 @@ def metadata_reader(wiim):
                         typ = bytes.fromhex(m.group(1).decode()).decode(errors="replace")
                         code = bytes.fromhex(m.group(2).decode()).decode(errors="replace")
                         data = base64.b64decode(m.group(4)) if m.group(4) else b""
+                        sequence += 1
+                        if typ == "ssnc" and code in ("odsc", "sdsc", "pbeg", "pend", "pfls", "paus", "prsm", "styp"):
+                            value = f" value={description_for_log(data)}" if code in ("sdsc", "styp") else ""
+                            log(f"metadata event seq={sequence} code={code} bytes={len(data)}{value}; {AUDIO.status()}")
 
+                        if typ == "ssnc" and handle_playback_metadata(code, data, wiim, pending):
+                            continue
                         if typ == "ssnc" and code == "copl" and data:
                             handle_copl(data)
                         elif typ == "core" and code in ("minm", "asar", "asal"):
@@ -487,31 +895,23 @@ def metadata_reader(wiim):
                             # seek/pause: make the player discard stale buffered
                             # audio so it reacts at the new position promptly
                             drop_clients("seek/pause" if code == "pfls" else "pause")
-                        elif typ == "ssnc" and code == "pbeg" and not STATE["active"]:
-                            RING.mark_session()
-                            # clear any stale now-playing/artwork left by a previous
-                            # session so a reconnect never pushes old metadata or art
-                            pending.clear()
-                            NOW_PLAYING.update(title="", artist="", album="", artwork="")
-                            ART.update(bytes=b"", hash=None)
-                            log("session begin")
-                            # let the first metadata land, then didl_pusher starts playback
-                            STATE.update(active=True, pushed=None, dirty=time.time())
-                        elif typ == "ssnc" and code == "pend":
-                            pending.clear()
-                            NOW_PLAYING.update(title="", artist="", album="", artwork="")
-                            ART.update(bytes=b"", hash=None)
-                            STATE.update(active=False, dirty=0.0, pushed=None)
-                            log("session end")
-                            wiim.stop()
                     # a partial cover-art item can be ~700KB of base64: keep enough tail
                     buf = buf[pos:] if pos else buf[-2097152:]
+            log(f"metadata pipe EOF unparsed_bytes={len(buf)} last_event_seq={sequence}; {AUDIO.status()}")
+            AUDIO.end("metadata pipe EOF")
+            STATE.update(active=False, dirty=0.0, pushed=None)
+            drop_clients("metadata pipe closed")
         except Exception as e:
-            log(f"metadata pipe error: {e}")
+            log(f"metadata pipe error: {e}; last_event_seq={sequence}; {AUDIO.status()}")
+            AUDIO.fail("metadata pipe lost")
+            drop_clients("metadata pipe lost")
             time.sleep(1)
 
 
 def main():
+    log(f"PCM requires Shairport 5+ ssnc/odsc metadata; formats={','.join(PCMFormat.FORMATS)} "
+        f"channels=1,2 pending_limit={PENDING_MAX} ring_seconds={RING_SECONDS} "
+        f"backlog_seconds={BACKLOG_SECONDS}; session IDs are local to this bridge process")
     os.makedirs(os.path.dirname(AUDIO_PIPE), exist_ok=True)
     for p in (AUDIO_PIPE, META_PIPE):
         if not os.path.exists(p):
