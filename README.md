@@ -31,7 +31,7 @@ iPhone ──AirPlay 2──▶ shairport-sync ──PCM pipe──▶ bridge �
 ## Quick start
 
 Requirements: Docker with compose, host networking available (mDNS/PTP),
-a UPnP/DLNA renderer on the same LAN.
+a UPnP/DLNA renderer on the same LAN, and Shairport Sync 5 or later.
 
 ```bash
 git clone https://github.com/leonroy/airplay2-dlna-bridge
@@ -63,6 +63,53 @@ a different name in the AirPlay menu, edit `general.name` in
 Everything is in `.env` (see `.env.example` for details): `DIDL_PUSH` toggles
 display updates, `MAX_VOLUME` caps the hardware volume, `STREAM_PORT` moves the
 stream port. The AirPlay name is set in `shairport-sync.conf` (`general.name`).
+
+### PCM output format
+
+Shairport's configuration selects its output, either fixed or automatic. Python
+does not read that configuration: it reads the resulting `ssnc/odsc` description
+(such as `48000/S24_3LE/2`) and derives the WAV header, FFmpeg input and buffers.
+Keep `metadata.enabled = "yes"` and the shared metadata pipe configured.
+
+The supplied configuration uses 16-bit/44.1 kHz stereo. For 24-bit/48 kHz, set
+these values in the `pipe` block:
+
+```conf
+output_rate = 48000;
+output_format = "S24_3LE";
+output_channels = 2;
+```
+
+All ten Shairport integer formats are supported, including big-endian and
+padded 24-bit samples. Normalization preserves sample values. Output must be
+mono or stereo; `odsc` does not specify a wider channel layout. FLAC stores
+8-bit input as 16-bit samples; full 32-bit FLAC requires FFmpeg's experimental
+encoder support and a compatible renderer.
+
+HTTP playback waits for `pbeg` and a valid `odsc`, returning 503 until ready.
+Early audio is buffered up to 4 MiB; the bridge never guesses a missing format.
+At session end, queued input is drained and late EOFs cannot close a newer session.
+After restarting only the bridge, disconnect and reconnect AirPlay to obtain
+a fresh description.
+
+For automatic selection, use `output_rate = "auto"` and a format list such as
+`output_format = ("S16_LE", "S24_3LE")`. New-session formats are accepted; a
+different `odsc` within one session stops playback. The separate metadata pipe
+provides no audio byte offset, and unannounced changes cannot be detected.
+Keep fixed output until automatic transitions pass live playback tests.
+
+### Diagnosing format metadata
+
+Logs correlate `sdsc` (incoming format), `odsc` (pipe output), session boundaries,
+pipe closures and HTTP/encoder activity using UTC timestamps and local session
+IDs. They report description timing, byte counts and rejection reasons. IDs
+reset on bridge restart. Follow both containers when reproducing a problem:
+
+```bash
+docker compose logs --timestamps --follow bridge shairport-sync
+```
+
+While audio waits for `odsc`, buffer status is logged at most every five seconds.
 
 
 ## Display updates and the track-change gap
