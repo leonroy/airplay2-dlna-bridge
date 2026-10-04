@@ -64,6 +64,22 @@ Everything is in `.env` (see `.env.example` for details): `DIDL_PUSH` toggles
 display updates, `MAX_VOLUME` caps the hardware volume, `STREAM_PORT` moves the
 stream port. The AirPlay name is set in `shairport-sync.conf` (`general.name`).
 
+Each bridge admits at most `HTTP_MAX_CONNECTIONS=16` HTTP connections, including
+incomplete requests, before creating handler threads. Extra connections receive
+503 and close. During playback, `FLAC_MAX_ENCODERS=4` limits simultaneous FFmpeg
+processes; an exhausted encoder budget returns 503 before spawning a process or
+sending success headers. The defaults allow three overlapping renderer streams
+observed during reconnects, plus one additional FLAC consumer, while leaving
+HTTP capacity for artwork and diagnostic requests. Cancelled streams keep their
+encoder slot until process and feeder cleanup completes.
+
+`HTTP_HEADER_TIMEOUT=5` bounds header inactivity and `HTTP_HEADER_DEADLINE=10`
+bounds the complete request line and headers, even when a peer sends bytes
+continuously. Both are in seconds and all four settings require positive
+integers. These deadlines end before response streaming, so healthy playback
+pauses and request-side half-closes retain their existing behavior. Limits are
+per bridge process; use `.env` or container environment overrides to change them.
+
 ### PCM output format
 
 Shairport's configuration selects its output, either fixed or automatic. Python
