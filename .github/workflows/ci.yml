@@ -76,3 +76,4 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+          STREAM_PORT=8001 docker compose -p airplay1-dlna-bridge -f docker-compose.yml -f docker-compose.airplay1.yml config --quiet

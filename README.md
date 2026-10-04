@@ -43,6 +43,28 @@ docker compose up -d
 
 Pick "AirPlay 2 Bridge" from the AirPlay menu on your iPhone and play.
 
+### Separate AirPlay 1 and AirPlay 2 endpoints
+
+For a classic AirPlay 1 endpoint, use the source-controlled override in a
+separate checkout/directory. Copy `.env.example` to `.env`, set the same host
+and renderer addresses, and set `STREAM_PORT=8001`:
+
+```bash
+docker compose -p airplay1-dlna-bridge -f docker-compose.yml -f docker-compose.airplay1.yml pull
+docker compose -p airplay1-dlna-bridge -f docker-compose.yml -f docker-compose.airplay1.yml up -d
+```
+
+This advertises "AirPlay 1 Bridge" on RTSP port 5000 and serves its bridge on
+port 8001. The ordinary deployment advertises "AirPlay 2 Bridge" on RTSP
+port 7000 and serves port 8000. Both use the same receiver configuration and
+published bridge image, with separate containers and shared-audio volumes.
+Keep the AP2 checkout's `STREAM_PORT=8000` and use a different project name
+for each endpoint. The `.env` files contain deployment settings; no edited
+receiver configuration or custom bridge source is required.
+
+If both endpoints target one renderer, select one at a time. Cross-process
+renderer ownership is not coordinated yet (issue #24).
+
 The bridge image is published to `ghcr.io/leonroy/airplay2-dlna-bridge` for
 Linux amd64 and arm64. Set `BRIDGE_IMAGE_TAG` in `.env` to a release version
 (without `v`) to pin it, or use `latest` to follow new releases. See
