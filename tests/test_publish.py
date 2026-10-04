@@ -9,6 +9,7 @@ import pytest
 ROOT = Path(__file__).parents[1]
 SHA = 'a' * 40
 DIGEST = 'sha256:' + 'b' * 64
+CHILD_DIGESTS = {'amd64': 'sha256:' + 'c' * 64, 'arm64': 'sha256:' + 'd' * 64}
 
 
 @pytest.fixture
@@ -25,7 +26,7 @@ def raw_index(publisher):
         'mediaType': 'application/vnd.oci.image.index.v1+json',
         'annotations': {publisher.REVISION: SHA, publisher.VERSION: '0.1.1'},
         'manifests': [
-            {'platform': {'os': 'linux', 'architecture': arch}}
+            {'platform': {'os': 'linux', 'architecture': arch}, 'digest': CHILD_DIGESTS[arch]}
             for arch in ('amd64', 'arm64')
         ],
     }
@@ -117,16 +118,78 @@ def test_new_candidate_promotes_raw_index_digest_to_version_and_latest(publisher
         if args[:3] == ('docker', 'buildx', 'build'):
             registry[args[args.index('--tag') + 1]] = DIGEST
         elif args[:4] == ('docker', 'buildx', 'imagetools', 'create'):
-            assert smoke_tests == [f'{publisher.IMAGE}@{DIGEST}']
+            assert smoke_tests == [
+                ('linux/amd64', f'{publisher.IMAGE}@{CHILD_DIGESTS["amd64"]}'),
+                ('linux/arm64', f'{publisher.IMAGE}@{CHILD_DIGESTS["arm64"]}'),
+            ]
             target = args[args.index('--tag') + 1]
             assert args[-1] == f'{publisher.IMAGE}@{DIGEST}'
             registry[target] = DIGEST
             promotions.append(target)
+        elif args[:2] == ['docker', 'run']:
+            platform, ref = args[3], args[5]
+            assert ref != f'{publisher.IMAGE}@{DIGEST}'
+            assert kwargs['input'] == publisher.SMOKE_PROGRAM
+            smoke_tests.append((platform, ref))
         else:
             pytest.fail(f'Unexpected command: {args}')
         return subprocess.CompletedProcess(args, 0, '', '')
 
     monkeypatch.setattr(publisher.subprocess, 'run', docker)
-    monkeypatch.setattr(publisher, 'smoke_image', smoke_tests.append)
     publisher.publish_image('v0.1.1', SHA, is_latest=True)
     assert promotions == [f'{publisher.IMAGE}:0.1.1', f'{publisher.IMAGE}:latest']
+
+
+@pytest.mark.parametrize('problem', ['missing', 'invalid', 'duplicate'])
+def test_bad_child_manifest_stops_before_running_containers(publisher, monkeypatch, problem):
+    manifest = raw_index(publisher)
+    if problem == 'missing':
+        manifest['manifests'].pop()
+    elif problem == 'invalid':
+        manifest['manifests'][1]['digest'] = 'invalid'
+    else:
+        manifest['manifests'].append(manifest['manifests'][1])
+    monkeypatch.setattr(publisher.subprocess, 'run', lambda *args, **kwargs: pytest.fail('Must not run containers'))
+    with pytest.raises(ValueError, match='child manifest'):
+        publisher.smoke_image(manifest)
+
+
+def test_smoke_failure_prevents_version_and_latest_promotion(publisher, monkeypatch):
+    monkeypatch.setenv('GITHUB_ACTIONS', 'true')
+    monkeypatch.setenv('GITHUB_REPOSITORY', 'leonroy/airplay2-dlna-bridge')
+    manifest = dict(raw_index(publisher), digest=DIGEST)
+    monkeypatch.setattr(publisher, 'inspect_image', lambda ref: None if ref.endswith(':0.1.1') else manifest)
+    monkeypatch.setattr(publisher, 'run', lambda *args: pytest.fail('Must not promote a failing image'))
+    calls = []
+
+    def docker(args, **kwargs):
+        calls.append(args)
+        if args[3] == 'linux/arm64':
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(publisher.subprocess, 'run', docker)
+    with pytest.raises(subprocess.CalledProcessError):
+        publisher.publish_image('v0.1.1', SHA, is_latest=True)
+    assert len(calls) == 2
+
+
+def test_existing_version_retry_smokes_children_and_keeps_index_for_latest(publisher, monkeypatch):
+    monkeypatch.setenv('GITHUB_ACTIONS', 'true')
+    monkeypatch.setenv('GITHUB_REPOSITORY', 'leonroy/airplay2-dlna-bridge')
+    monkeypatch.delenv('GITHUB_STEP_SUMMARY', raising=False)
+    manifest = dict(raw_index(publisher), digest=DIGEST)
+    manifest['manifests'].append({
+        'platform': {'os': 'unknown', 'architecture': 'unknown'},
+        'digest': 'sha256:' + 'e' * 64,
+    })
+    monkeypatch.setattr(publisher, 'inspect_image', lambda ref: manifest)
+    calls, latest = [], []
+    monkeypatch.setattr(publisher.subprocess, 'run', lambda args, **kwargs: calls.append(args))
+    monkeypatch.setattr(publisher, 'promote_latest', lambda *args: latest.append(args))
+    publisher.publish_image('v0.1.1', SHA, is_latest=True)
+    assert [(args[3], args[5]) for args in calls] == [
+        ('linux/amd64', f'{publisher.IMAGE}@{CHILD_DIGESTS["amd64"]}'),
+        ('linux/arm64', f'{publisher.IMAGE}@{CHILD_DIGESTS["arm64"]}'),
+    ]
+    assert latest == [('0.1.1', DIGEST)]
