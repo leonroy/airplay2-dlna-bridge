@@ -24,6 +24,7 @@ def coordinator(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location('release_coordinator', ROOT / '.github/scripts/release.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module, 'publish_image', lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
     (tmp_path / 'pyproject.toml').write_text((ROOT / 'pyproject.toml').read_text())
     return module
@@ -155,6 +156,43 @@ def test_release_refuses_to_run_locally(coordinator, monkeypatch):
     monkeypatch.setattr(coordinator, 'run', lambda *args: pytest.fail('Must not execute release commands'))
     with pytest.raises(SystemExit, match='only enabled'):
         coordinator.main()
+
+
+def test_image_retry_uses_tagged_source_before_processing_pending_prs(coordinator, monkeypatch):
+    monkeypatch.setenv('GITHUB_ACTIONS', 'true')
+    monkeypatch.setenv('GITHUB_REPOSITORY', 'leonroy/airplay2-dlna-bridge')
+    tagged = make_pr(2, 'tagged')
+    pending = make_pr(3, 'pending')
+    monkeypatch.setattr(coordinator, 'merged_pull_requests', lambda: [pending, tagged])
+    monkeypatch.setattr(coordinator, 'get_release', lambda tag: {'assets': [{'name': 'CHANGELOG.md'}]})
+    current = {'sha': 'pending'}
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        if args[:3] == ('git', 'rev-list', '--first-parent'):
+            return 'tagged\npending'
+        if args == ('git', 'tag', '--list'):
+            return 'v0.1.1'
+        if args[:4] == ('git', 'rev-list', '-n', '1'):
+            return 'tagged'
+        if args[:3] == ('git', 'checkout', '-B'):
+            current['sha'] = args[-1]
+        return ''
+
+    def fail_publishing(tag, sha, *, is_latest):
+        assert tag == 'v0.1.1'
+        assert current['sha'] == sha == 'tagged'
+        assert is_latest
+        raise RuntimeError('Registry unavailable')
+
+    monkeypatch.setattr(coordinator, 'run', fake_run)
+    monkeypatch.setattr(coordinator, 'publish_image', fail_publishing)
+    with pytest.raises(RuntimeError, match='Registry unavailable'):
+        coordinator.main()
+    assert not any(args[0] == 'semantic-release' for args in calls)
+    assert not any(args[:3] == ('gh', 'release', 'create') for args in calls)
+    assert ('git', 'checkout', '-B', 'main', 'pending') not in calls
 
 
 @pytest.mark.parametrize('retry_after_first_tag', [False, True])

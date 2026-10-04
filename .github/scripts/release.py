@@ -1,5 +1,6 @@
 """Release each merged PR once, independently of its Git merge method."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,14 @@ from semantic_release.enums import LevelBump
 # History before release automation was introduced is not released individually.
 BASELINE = "6089a33ae8ffa5020c10a98d30fcaa92e8423eec"
 VERSION_TAG = re.compile(r"v\d+\.\d+\.\d+\Z")
+_publisher_spec = importlib.util.spec_from_file_location('image_publisher', Path(__file__).with_name('publish.py'))
+_publisher = importlib.util.module_from_spec(_publisher_spec)
+_publisher_spec.loader.exec_module(_publisher)
+publish_image = _publisher.publish_image
+
+
+def publish_release_image(tag, sha, tags):
+    publish_image(tag, sha, is_latest=_publisher.version_tuple(tag) == max(_publisher.version_tuple(t) for t in tags))
 
 
 def run(*args):
@@ -122,6 +131,9 @@ def main():
             entries.append((tag, pr))
             if i == last_tagged:
                 ensure_release(tag, pr, entries)
+                if _publisher.version_tuple(tag) > (0, 1, 0):
+                    run("git", "checkout", "-B", "main", sha)
+                publish_release_image(tag, sha, tags)
             continue
         if i < last_tagged:
             raise ValueError(f"PR #{pr['number']} is untagged before a later release; repair release history first")
@@ -145,6 +157,7 @@ def main():
         entries.append((tag, pr))
         ensure_release(tag, pr, entries)
         tags.append(tag)
+        publish_release_image(tag, sha, tags)
 
 
 if __name__ == "__main__":

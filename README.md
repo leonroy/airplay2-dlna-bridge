@@ -1,7 +1,7 @@
 # airplay2-dlna-bridge
 
 Stream **AirPlay 2** from your iPhone/Mac to any **UPnP/DLNA renderer** — with
-lossless audio, track title/artist/album, cover art, and hardware volume
+FLAC audio, track title/artist/album, cover art, and hardware volume
 control. Built for and tested on the **WiiM Ultra** (which has no AirPlay of
 its own), but the renderer side is generic UPnP.
 
@@ -16,7 +16,8 @@ iPhone ──AirPlay 2──▶ shairport-sync ──PCM pipe──▶ bridge �
 ## Features
 
 - **Lossless**: PCM from AirPlay is repackaged as FLAC (`-compression_level 0`),
-  no lossy transcoding
+  with no lossy transcoding in the bridge. This does not guarantee end-to-end
+  lossless playback: the bridge cannot restore quality lost before receiving PCM.
 - **Now playing on the renderer's display**: title / artist / album / cover art,
   refreshed on every track change (see *Display updates* below)
 - **Volume**: the phone's volume slider drives the renderer's hardware volume
@@ -33,13 +34,25 @@ Requirements: Docker with compose, host networking available (mDNS/PTP),
 a UPnP/DLNA renderer on the same LAN.
 
 ```bash
-git clone https://github.com/shinn-y/airplay2-dlna-bridge
+git clone https://github.com/leonroy/airplay2-dlna-bridge
 cd airplay2-dlna-bridge
 cp .env.example .env      # edit HOST_IP and RENDERER_IP(WiiM)
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 Pick "AirPlay 2 Bridge" from the AirPlay menu on your iPhone and play.
+
+The bridge image is published to `ghcr.io/leonroy/airplay2-dlna-bridge` for
+Linux amd64 and arm64. Set `BRIDGE_IMAGE_TAG` in `.env` to a release version
+(without `v`) to pin it, or use `latest` to follow new releases. See
+[RELEASING.md](RELEASING.md) for publishing and rollback details.
+
+For local development, build the checked-out source with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+```
 
 To show
 a different name in the AirPlay menu, edit `general.name` in
