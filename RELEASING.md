@@ -41,8 +41,11 @@ The release job publishes `ghcr.io/leonroy/airplay2-dlna-bridge` for `linux/amd6
 and `linux/arm64`, starting after `v0.1.0`. Existing `v0.1.0` is not backfilled.
 It checks out each release's exact commit, builds a `sha-<full-commit-sha>`
 candidate, and tests bridge import and exact PCM/FLAC round trips on both
-architectures. It promotes the tested manifest digest to the version without
-`v` (e.g. `0.1.1`), then to `latest` for the newest release.
+architectures. Metadata-aware images also check startup gating and all ten
+integer formats at 44.1 and 48 kHz; retries of older images retain their original
+16-bit/44.1 kHz check. It promotes
+the tested manifest digest to the version without `v` (e.g. `0.1.1`), then to
+`latest` for the newest release.
 
 Retries repair image publishing without creating another release. Existing
 version images must match the source revision, version, and platforms; they
@@ -60,6 +63,10 @@ Production Compose pulls the image selected by `BRIDGE_IMAGE_TAG` (default
 `latest`). Pin a version in `.env`, run `docker compose pull bridge`, then
 `docker compose up -d bridge`. For rollback, select an earlier published version
 and repeat those commands. `v0.1.0` has no published image.
+
+Preserve existing fixed PCM settings and reconnect AirPlay after replacing the
+bridge. See [PCM output format](README.md#pcm-output-format) for metadata
+requirements and automatic-selection limits.
 
 For local builds, use the development override described in the
 [README quick start](README.md#quick-start).

@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from audio_helpers import AudioPipe
+
 
 @pytest.fixture
 def bridge():
@@ -12,3 +14,18 @@ def bridge():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def audio_pipe():
+    """Create pipes and clean up even when a race assertion fails."""
+    pipes = []
+
+    def create(audio=None):
+        pipe = AudioPipe(audio)
+        pipes.append(pipe)
+        return pipe
+
+    yield create
+    for pipe in reversed(pipes):
+        pipe.close()

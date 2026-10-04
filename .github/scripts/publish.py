@@ -72,8 +72,23 @@ def validate_image(manifest, version, sha):
     return manifest['digest']
 
 
-def smoke_image(ref):
+def smoke_image(manifest):
+    images = {}
+    for item in manifest.get('manifests', []):
+        platform_info = item.get('platform', {})
+        platform = f"{platform_info.get('os')}/{platform_info.get('architecture')}"
+        if platform not in PLATFORMS:
+            continue
+        digest = item.get('digest', '')
+        if not DIGEST.fullmatch(digest) or platform in images:
+            raise ValueError(f'Invalid or ambiguous child manifest for {platform}')
+        images[platform] = f'{IMAGE}@{digest}'
+    if set(images) != set(PLATFORMS):
+        raise ValueError('Missing child manifest for a required platform')
     for platform in PLATFORMS:
+        # Each architecture has its own digest, avoiding classic Docker's
+        # conflict when loading two platforms under the same index digest.
+        ref = images[platform]
         print(f'Smoke testing {ref} on {platform}', flush=True)
         subprocess.run(
             ['docker', 'run', '--platform', platform, '-i', ref, 'python3', '-'],
@@ -135,7 +150,7 @@ def publish_image(tag, sha, *, is_latest):
         if manifest is None:
             raise RuntimeError('Candidate image is missing after its build')
         digest = validate_image(manifest, version, sha)
-        smoke_image(f'{IMAGE}@{digest}')
+        smoke_image(manifest)
         # Check again immediately before promotion; never knowingly replace a version.
         existing = inspect_image(ref)
         if existing is not None:
@@ -148,7 +163,7 @@ def publish_image(tag, sha, *, is_latest):
             raise ValueError('Version promotion did not preserve the tested image digest')
     else:
         digest = validate_image(manifest, version, sha)
-        smoke_image(f'{IMAGE}@{digest}')
+        smoke_image(manifest)
     if is_latest:
         promote_latest(version, digest)
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
