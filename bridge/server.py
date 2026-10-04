@@ -9,9 +9,10 @@
 - the shairport metadata pipe drives UPnP Play/Stop, hardware volume, and
   now-playing DIDL pushes on the renderer
 """
-import base64, collections, os, plistlib, re, select, socket, struct, subprocess, threading, time, urllib.request
+import base64, collections, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
+from xml.etree import ElementTree
 
 AUDIO_PIPE = "/shared/audio"
 META_PIPE = "/shared/metadata"
@@ -176,15 +177,15 @@ class Ring:
             self.closed = True
             self.cond.notify_all()
 
-    def read_from(self, pos, timeout=5):
+    def read_from(self, pos, timeout=5, cancel=None):
         """return (newpos, bytes) at absolute pos, waiting for data if at the end"""
         with self.cond:
-            if self.closed:
+            if self.closed or (cancel is not None and cancel.is_set()):
                 raise StreamEnded()
             end = self.head + len(self.buf)
             if pos >= end:
                 self.cond.wait(timeout)
-                if self.closed:
+                if self.closed or (cancel is not None and cancel.is_set()):
                     raise StreamEnded()
                 end = self.head + len(self.buf)
                 if pos >= end:
@@ -417,23 +418,101 @@ DIDL_PUSH = os.environ.get("DIDL_PUSH", "1") == "1"
 # audio and reconnects at the new position (faster reaction to phone actions)
 FLUSH_RESYNC = os.environ.get("FLUSH_RESYNC", "1") == "1"
 PUSH_SETTLE = 2.0
-STATE = {"active": False, "dirty": 0.0, "pushed": None}
-CLIENTS = set()          # sockets of connected stream clients
+STATE = {"active": False, "dirty": 0.0, "pushed": None, "revision": 0}
+
+
+def mark_metadata_dirty():
+    """Call under AUDIO.lock; revisions prevent stale completions losing updates."""
+    STATE["revision"] += 1
+    STATE["dirty"] = time.monotonic()
+
+
+CLIENTS = set()          # StreamClient records, including cleanup in progress
+CLIENTS_LOCK = threading.Lock()
+STREAM_POLL_SECONDS = 0.1
+STREAM_WRITE_TIMEOUT = 30
+
+
+class StreamClient:
+    """Own one response's cancellation and encoder lifetime.
+
+    A receive-side FIN is not cancellation: HTTP clients can half-close their
+    request side and continue consuming the response, including through pauses.
+    """
+    def __init__(self, ring, connection):
+        self.ring = ring
+        self.session_id = ring.session_id
+        self.connection = connection
+        self.cancelled = threading.Event()
+        self.encoder = None
+        self.feeder = None
+
+    def wake(self):
+        self.cancelled.set()
+        with self.ring.cond:
+            self.ring.cond.notify_all()
+
+    def interrupt(self):
+        self.wake()
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def check(self):
+        if self.cancelled.is_set() or self.ring.closed:
+            raise StreamEnded()
+        # A reset is definitive response failure, unlike request-side FIN.
+        # Checking SO_ERROR avoids polling a permanently readable EOF socket.
+        error = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if error:
+            raise OSError(error, os.strerror(error))
+
+
+def register_client(client):
+    with CLIENTS_LOCK:
+        if client.ring.closed:
+            client.cancelled.set()
+        CLIENTS.add(client)
+
+
+def unregister_client(client):
+    with CLIENTS_LOCK:
+        CLIENTS.discard(client)
+
+
+def has_active_clients(session_id):
+    with CLIENTS_LOCK:
+        return any(c.session_id == session_id and not c.cancelled.is_set()
+                   and not c.ring.closed for c in CLIENTS)
+
+
+def _cancel_clients(session_id, reason, *, all_sessions=False):
+    with CLIENTS_LOCK:
+        clients = [c for c in CLIENTS if (all_sessions or c.session_id == session_id)
+                   and not c.cancelled.is_set()]
+        # Exclude these streams from playback decisions before interrupting I/O.
+        for client in clients:
+            client.cancelled.set()
+    for client in clients:
+        client.interrupt()
+    if clients:
+        log(f"{reason}: cancelled {len(clients)} stream client(s)")
+
+
+def cancel_session_clients(session_id, reason):
+    _cancel_clients(session_id, reason)
+
+
+def cancel_all_clients(reason):
+    _cancel_clients(None, reason, all_sessions=True)
 
 
 def drop_clients(reason):
     ring = AUDIO.snapshot()
     if ring is not None:
         ring.mark_session()
-    n = 0
-    for s in list(CLIENTS):
-        try:
-            s.shutdown(socket.SHUT_RDWR)
-            n += 1
-        except OSError:
-            pass
-    if n:
-        log(f"{reason}: dropped {n} client(s) to resync")
+    cancel_all_clients(reason)
 
 
 def wav_header(pcm):
@@ -445,6 +524,23 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         log(f"http {self.address_string()} {fmt % args}")
+
+    def write_stream(self, client, data):
+        """Bound response writes too: shutdown alone need not wake a timed send."""
+        remaining = memoryview(data)
+        deadline = time.monotonic() + STREAM_WRITE_TIMEOUT
+        while remaining:
+            client.check()
+            try:
+                sent = self.connection.send(remaining)
+            except socket.timeout:
+                if time.monotonic() >= deadline:
+                    raise
+                continue
+            if sent == 0:
+                raise StreamEnded()
+            remaining = remaining[sent:]
+            deadline = time.monotonic() + STREAM_WRITE_TIMEOUT
 
     def do_GET(self):
         if self.path.startswith("/stream.flac"):
@@ -476,23 +572,30 @@ class StreamHandler(BaseHTTPRequestHandler):
             log(f"wav request rejected HTTP=503; {AUDIO.status()}")
             self.send_error(503, "Waiting for a valid Shairport output description")
             return
-        self.connection.settimeout(30)
-        self.send_response(200)
-        self.send_header("Content-Type", "audio/wav")
-        self.end_headers()
-        log(f"wav client {self.address_string()} connected session={ring.session_id} pcm={ring.pcm.description}")
-        pos = ring.join_pos()
-        CLIENTS.add(self.connection)
+        client = StreamClient(ring, self.connection)
+        register_client(client)
         try:
-            self.wfile.write(wav_header(ring.pcm))
+            if client.cancelled.is_set():
+                return
+            self.connection.settimeout(30)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.end_headers()
+            self.connection.settimeout(STREAM_POLL_SECONDS)
+            log(f"wav client {self.address_string()} connected session={ring.session_id} pcm={ring.pcm.description}")
+            pos = ring.join_pos()
+            self.write_stream(client, wav_header(ring.pcm))
             while True:
-                pos, data = ring.read_from(pos)
+                client.check()
+                pos, data = ring.read_from(pos, timeout=STREAM_POLL_SECONDS,
+                                           cancel=client.cancelled)
                 if data:
-                    self.wfile.write(data)
+                    self.write_stream(client, data)
         except (StreamEnded, BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
             log(f"wav client {self.address_string()} disconnected session={ring.session_id} ring_closed={ring.closed}")
         finally:
-            CLIENTS.discard(self.connection)
+            client.wake()
+            unregister_client(client)
 
     # ---- main endpoint: FLAC + ICY, the combo airupnp uses on the WiiM ----
     def serve_flac(self):
@@ -501,74 +604,93 @@ class StreamHandler(BaseHTTPRequestHandler):
             log(f"flac request rejected HTTP=503; {AUDIO.status()}")
             self.send_error(503, "Waiting for a valid Shairport output description")
             return
-        icy = self.headers.get("Icy-MetaData") == "1"
-        self.connection.settimeout(30)
-        self.send_response(200)
-        self.send_header("Content-Type", "audio/flac")
-        self.send_header("icy-name", "AirPlay 2")
-        if icy:
-            self.send_header("icy-metaint", str(ICY_META_INT))
-        self.end_headers()
-        log(f"flac client {self.address_string()} connected (icy={icy}) "
-            f"session={ring.session_id} pcm={ring.pcm.description}")
-
-        enc = subprocess.Popen(
-            ring.pcm.encoder_command(),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-
-        CLIENTS.add(self.connection)
-        stop = threading.Event()
-
+        client = StreamClient(ring, self.connection)
+        register_client(client)
         def feeder():
             pos = ring.join_pos()
             try:
-                while not stop.is_set():
-                    pos, data = ring.read_from(pos)
+                while not client.cancelled.is_set():
+                    pos, data = ring.read_from(pos, cancel=client.cancelled)
                     if data:
-                        enc.stdin.write(data)
-                        enc.stdin.flush()
+                        client.encoder.stdin.write(data)
+                        client.encoder.stdin.flush()
             except (StreamEnded, BrokenPipeError, OSError):
                 pass
             finally:
                 try:
-                    enc.stdin.close()
+                    client.encoder.stdin.close()
                 except OSError:
                     pass
-
-        threading.Thread(target=feeder, daemon=True).start()
-
-        sent_since_meta, last_meta = 0, None
         try:
-            while True:
-                data = enc.stdout.read1(8192)
+            if client.cancelled.is_set():
+                return
+            # Spawn before acknowledging success, and own it even if headers or
+            # feeder setup fail. No output probing/read can trap cleanup forever.
+            client.encoder = subprocess.Popen(
+                ring.pcm.encoder_command(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            icy = self.headers.get("Icy-MetaData") == "1"
+            self.connection.settimeout(30)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/flac")
+            self.send_header("icy-name", "AirPlay 2")
+            if icy:
+                self.send_header("icy-metaint", str(ICY_META_INT))
+            self.end_headers()
+            self.connection.settimeout(STREAM_POLL_SECONDS)
+            log(f"flac client {self.address_string()} connected (icy={icy}) "
+                f"session={ring.session_id} pcm={ring.pcm.description}")
+            fd = client.encoder.stdout.fileno()
+            os.set_blocking(fd, False)
+            client.feeder = threading.Thread(target=feeder, daemon=True)
+            client.feeder.start()
+            sent_since_meta, last_meta = 0, None
+            while not client.cancelled.is_set() and not ring.closed:
+                client.check()
+                ready, _, _ = select.select([fd], [], [], STREAM_POLL_SECONDS)
+                if not ready:
+                    continue
+                try:
+                    data = os.read(fd, 8192)
+                except BlockingIOError:
+                    continue
                 if not data:
                     break
                 if not icy:
-                    self.wfile.write(data)
+                    self.write_stream(client, data)
                     continue
                 while data:
                     room = ICY_META_INT - sent_since_meta
-                    self.wfile.write(data[:room])
+                    self.write_stream(client, data[:room])
                     sent_since_meta += min(room, len(data))
                     data = data[room:]
                     if sent_since_meta == ICY_META_INT:
                         block, last_meta = self.icy_block(last_meta)
-                        self.wfile.write(block)
+                        self.write_stream(client, block)
                         sent_since_meta = 0
-        except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
+        except (StreamEnded, BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
             log(f"flac client {self.address_string()} disconnected session={ring.session_id}")
         finally:
-            CLIENTS.discard(self.connection)
-            stop.set()
-            result = enc.poll()
-            if result is not None and result != 0:
-                log(f"flac encoder failed exit={result} session={ring.session_id} pcm={ring.pcm.description}")
-            log(f"flac stream closed session={ring.session_id} ring_closed={ring.closed}")
+            client.wake()
             try:
-                enc.kill()
-            except OSError:
-                pass
-            enc.wait()
+                enc = client.encoder
+                if enc is not None:
+                    result = enc.poll()
+                    if result is not None and result != 0:
+                        log(f"flac encoder failed exit={result} session={ring.session_id} pcm={ring.pcm.description}")
+                    # Killing first releases a feeder blocked on a full stdin
+                    # pipe. Only the feeder closes its buffered stdin wrapper.
+                    if result is None:
+                        enc.kill()
+                    enc.wait()
+                    if client.feeder is not None and client.feeder.ident is not None:
+                        client.feeder.join()
+                    else:
+                        enc.stdin.close()
+                    enc.stdout.close()
+                log(f"flac stream closed session={ring.session_id} ring_closed={ring.closed}")
+            finally:
+                unregister_client(client)
 
     @staticmethod
     def icy_block(last):
@@ -585,15 +707,17 @@ class StreamHandler(BaseHTTPRequestHandler):
         return bytes([(len(raw) + pad) // 16]) + raw + b"\x00" * pad, cur
 
 
-def handle_audio_eof(generation):
+def handle_audio_eof(generation, wiim=None):
     with AUDIO.lock:
         if generation is None or generation != AUDIO.session_id:
             log(f"audio EOF ignored ended_generation={generation}; {AUDIO.status()}")
             return False
         AUDIO.end("audio pipe EOF", drain=False)
         STATE.update(active=False, dirty=0.0, pushed=None)
-        drop_clients("audio pipe closed")
-        return True
+        if wiim is not None:
+            wiim.stop(generation)
+    cancel_session_clients(generation, "audio pipe closed")
+    return True
 
 
 def audio_reader(wiim):
@@ -614,79 +738,155 @@ def audio_reader(wiim):
                             continue
                         if not data:
                             break
-                        now = time.time()
+                        now = time.monotonic()
                         # Only resume a player with a valid output description.
-                        if (last and now - last > 2 and STATE["active"] and not CLIENTS
+                        if (last and now - last > 2 and STATE["active"] and not has_active_clients(generation)
                                 and AUDIO.snapshot() is not None):
                             log(f"audio resumed, kicking player; {AUDIO.status()}")
-                            threading.Thread(target=wiim.action, daemon=True,
-                                             args=("Play", "<Speed>1</Speed>")).start()
+                            wiim.resume(generation)
                         last = now
                 finally:
                     AUDIO.detach_audio(fd)
-            handle_audio_eof(generation)
+            handle_audio_eof(generation, wiim)
         except Exception as e:
             log(f"audio pipe error: {e}; {AUDIO.status()}")
             time.sleep(1)
 
 
 # ------------------------------------------------------------ renderer control
-def http_req(url, data=None, headers=None, timeout=5):
-    req = urllib.request.Request(url, data=data, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+HTTP_TIMEOUT = 5.0
+HTTP_BODY_MAX = 1024 * 1024
+SOAP_BODY_MAX = 64 * 1024
+
+
+def http_req(url, data=None, headers=None, timeout=HTTP_TIMEOUT, *, deadline=None,
+             max_bytes=HTTP_BODY_MAX):
+    """Bound the entire numeric-IP HTTP exchange, including trickling responses.
+
+    The watchdog shuts down the actual socket: no orphan request can keep the
+    serialized dispatcher busy after its deadline. DNS is deliberately excluded
+    by requiring the documented RENDERER_IP/WIIM_IP to be a numeric address.
+    """
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "http" or parts.username or parts.password:
+        raise ValueError("renderer control requires a plain HTTP numeric-IP URL")
+    address = ipaddress.ip_address(parts.hostname)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("renderer command deadline exceeded")
+    sock = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
+                         socket.SOCK_STREAM)
+    expired = threading.Event()
+
+    def abort():
+        expired.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+    watchdog = threading.Timer(remaining, abort)
+    watchdog.daemon = True
+    connection = http.client.HTTPConnection(parts.hostname, parts.port or 80,
+                                             timeout=remaining)
+    response = None
+    watchdog.start()
+    try:
+        sock.settimeout(remaining)
+        sock.connect((str(address), parts.port or 80))
+        connection.sock = sock
+        target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+        connection.request("POST" if data is not None else "GET", target,
+                           body=data, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read(max_bytes + 1)
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError("renderer command deadline exceeded")
+        if len(body) > max_bytes:
+            raise ValueError("renderer response exceeds size limit")
+        if not 200 <= response.status < 300:
+            raise OSError(f"renderer HTTP status {response.status}")
+        return body
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+        if response is not None:
+            response.close()
+        connection.close()
+        sock.close()
+
+
+PlaybackSnapshot = collections.namedtuple(
+    "PlaybackSnapshot", "session revision title artist album art_id artwork url")
 
 
 class Renderer:
+    """Nonblocking publishers plus one worker that owns all renderer I/O."""
+    RETRY_DELAYS = (0.25, 0.5, 1.0)
+
     def __init__(self, ip):
         self.ip, self.controls = ip, {}
+        self.stop_revision = self.stopped_revision = 0
+        self.volume = None
+        self.volume_revision = self.resume_revision = 0
+        self.resume_session = None
+        self.job = None
+        self.retries = {}
+        self.stop_session = None
 
-    def resolve(self, service):
+    def resolve(self, service, deadline):
         if not self.ip:
             return None
         if service not in self.controls:
-            try:
-                desc = http_req(f"http://{self.ip}:49152/description.xml").decode(errors="replace")
-                m = re.search(rf"<service>(?:(?!</service>).)*?{service}(?:(?!</service>).)*?"
-                              r"<controlURL>([^<]+)</controlURL>", desc, re.S)
-                if m:
-                    path = m.group(1)
-                    self.controls[service] = (f"http://{self.ip}:49152"
-                                              f"{path if path.startswith('/') else '/' + path}")
-                    log(f"renderer {service}: {self.controls[service]}")
-            except Exception as e:
-                log(f"renderer description fetch failed: {e}")
+            host = f"[{self.ip}]" if ":" in self.ip else self.ip
+            desc = http_req(f"http://{host}:49152/description.xml",
+                            deadline=deadline).decode(errors="replace")
+            m = re.search(rf"<service>(?:(?!</service>).)*?{service}(?:(?!</service>).)*?"
+                          r"<controlURL>([^<]+)</controlURL>", desc, re.S)
+            if m:
+                path = m.group(1)
+                self.controls[service] = (f"http://{host}:49152"
+                                          f"{path if path.startswith('/') else '/' + path}")
+            else:
+                raise ValueError(f"renderer has no {service} control URL")
         return self.controls.get(service)
 
     def action(self, name, args, service="AVTransport"):
-        control = self.resolve(service)
-        if not control:
-            return
-        srv = f"urn:schemas-upnp-org:service:{service}:1"
-        body = (f'<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-                f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
-                f'<u:{name} xmlns:u="{srv}"><InstanceID>0</InstanceID>{args}</u:{name}>'
-                f'</s:Body></s:Envelope>')
+        """Worker-only I/O. Return failure explicitly, including SOAP faults."""
+        deadline = time.monotonic() + HTTP_TIMEOUT
         try:
-            http_req(control, data=body.encode(), headers={
+            control = self.resolve(service, deadline)
+            if not control:
+                return False
+            srv = f"urn:schemas-upnp-org:service:{service}:1"
+            body = (f'<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                    f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+                    f'<u:{name} xmlns:u="{srv}"><InstanceID>0</InstanceID>{args}</u:{name}>'
+                    f'</s:Body></s:Envelope>')
+            response = http_req(control, data=body.encode(), headers={
                 "Content-Type": 'text/xml; charset="utf-8"',
-                "SOAPACTION": f'"{srv}#{name}"'})
-        except Exception as e:
-            log(f"renderer {name} failed: {e}")
+                "SOAPACTION": f'"{srv}#{name}"'}, deadline=deadline,
+                max_bytes=SOAP_BODY_MAX)
+            document = ElementTree.fromstring(response)
+            if any(element.tag.rsplit("}", 1)[-1] == "Fault" for element in document.iter()):
+                raise ValueError("renderer returned a SOAP fault")
+            expected = f"{{{srv}}}{name}Response"
+            if not any(element.tag == expected for element in document.iter()):
+                raise ValueError(f"renderer omitted {name}Response")
+            return True
+        except Exception as error:
+            log(f"renderer {name} failed: {error}")
+            return False
 
-    def set_volume(self, vol):
-        self.action("SetVolume",
-                    f"<Channel>Master</Channel><DesiredVolume>{vol}</DesiredVolume>",
-                    service="RenderingControl")
-        log(f"renderer: volume {vol}")
-
-    def play(self, url):
-        title = escape(NOW_PLAYING["title"] or "AirPlay 2")
-        artist = escape(NOW_PLAYING["artist"])
-        album = escape(NOW_PLAYING["album"])
+    @staticmethod
+    def uri_args(snapshot):
+        title = escape(snapshot.title or "AirPlay 2")
+        artist, album = escape(snapshot.artist), escape(snapshot.album)
         art = ""
-        if ART["bytes"]:
-            art_url = url.rsplit("/", 1)[0] + "/art-%d.jpg" % ART["id"]
+        if snapshot.artwork:
+            art_url = snapshot.url.rsplit("/", 1)[0] + f"/art-{snapshot.art_id}.jpg"
             art = f'<upnp:albumArtURI>{escape(art_url)}</upnp:albumArtURI>'
         didl = escape(
             '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
@@ -696,15 +896,147 @@ class Renderer:
             f'<dc:creator>{artist}</dc:creator><upnp:artist>{artist}</upnp:artist>'
             f'<upnp:album>{album}</upnp:album>{art}'
             '<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>'
-            f'<res protocolInfo="http-get:*:audio/flac:*">{url}</res></item></DIDL-Lite>')
-        self.action("SetAVTransportURI", f"<CurrentURI>{escape(url)}</CurrentURI>"
-                                         f"<CurrentURIMetaData>{didl}</CurrentURIMetaData>")
-        self.action("Play", "<Speed>1</Speed>")
-        log(f"renderer: play ({NOW_PLAYING['artist']} - {NOW_PLAYING['title']}, art={bool(ART['bytes'])})")
+            f'<res protocolInfo="http-get:*:audio/flac:*">{escape(snapshot.url)}</res></item></DIDL-Lite>')
+        return (f"<CurrentURI>{escape(snapshot.url)}</CurrentURI>"
+                f"<CurrentURIMetaData>{didl}</CurrentURIMetaData>")
 
-    def stop(self):
-        self.action("Stop", "")
-        log("renderer: stop")
+    def set_volume(self, vol):
+        with AUDIO.lock:
+            self.volume_revision += 1
+            self.volume = (AUDIO.session_id, vol, self.volume_revision)
+
+    def resume(self, session_id):
+        with AUDIO.lock:
+            if session_id != AUDIO.session_id or not STATE["active"]:
+                return
+            self.resume_revision += 1
+            self.resume_session = (session_id, self.resume_revision)
+
+    def stop(self, session_id=None):
+        with AUDIO.lock:
+            self.stop_revision += 1
+            self.stop_session = AUDIO.session_id if session_id is None else session_id
+            # Clear only commands belonging to the ending/rejected session.
+            if self.resume_session and self.resume_session[0] == self.stop_session:
+                self.resume_session = None
+            if self.volume and self.volume[0] == self.stop_session:
+                self.volume = None
+
+    def _current(self, snapshot):
+        return (STATE["active"] and AUDIO.snapshot() is not None
+                and AUDIO.session_id == snapshot.session
+                and STATE["revision"] == snapshot.revision)
+
+    def _eligible(self, kind, value, now):
+        retry = self.retries.get(kind)
+        if retry is None or retry["value"] != value:
+            retry = self.retries[kind] = dict(value=value, failures=0, at=0.0, exhausted=False)
+        return not retry["exhausted"] and now >= retry["at"]
+
+    def _select(self, now):
+        """Coalesce work under AUDIO.lock; independent backoffs cannot monopolize it."""
+        if self.stop_revision != self.stopped_revision:
+            stop = self.stop_revision
+            retry = self.retries.get("stop")
+            replacement = (STATE["active"] and AUDIO.snapshot() is not None
+                           and AUDIO.session_id != self.stop_session)
+            if replacement and retry and retry["value"] == stop and retry["failures"]:
+                # A valid replacement URI reconciles uncertain effects of the old Stop.
+                self.stopped_revision = stop
+            elif self._eligible("stop", stop, now):
+                return ("stop", stop)
+        if self.job and not self._current(self.job[0]):
+            self.job = None
+        if not self.job and (STATE["active"] and AUDIO.snapshot() is not None and STATE["dirty"]
+                             and now - STATE["dirty"] >= PUSH_SETTLE):
+            snapshot = PlaybackSnapshot(AUDIO.session_id, STATE["revision"],
+                                       NOW_PLAYING["title"], NOW_PLAYING["artist"],
+                                       NOW_PLAYING["album"], ART["id"], bool(ART["bytes"]),
+                                       STREAM_URL)
+            display = (snapshot.title, snapshot.artist, snapshot.album, snapshot.art_id)
+            if display == STATE["pushed"] or (STATE["pushed"] is not None and not DIDL_PUSH):
+                STATE["dirty"] = 0.0
+            else:
+                self.job = (snapshot, "uri")
+        if self.job and self._eligible("playback", (self.job[0], self.resume_revision), now):
+            return ("playback", self.job[0])
+        if self.resume_session is not None:
+            session = self.resume_session[0]
+            if not STATE["active"] or AUDIO.snapshot() is None or session != AUDIO.session_id:
+                self.resume_session = None
+            elif (STATE["pushed"] is not None or (self.job and self.job[1] == "play")):
+                # A bare Play is safe only after this session's URI was installed.
+                if self._eligible("resume", self.resume_session, now):
+                    return ("resume", self.resume_session)
+        if self.volume is not None:
+            if self.volume[0] != AUDIO.session_id:
+                self.volume = None
+            elif self._eligible("volume", self.volume, now):
+                return ("volume", self.volume)
+        return None
+
+    def _ack_playback(self, snapshot):
+        STATE["pushed"] = (snapshot.title, snapshot.artist, snapshot.album, snapshot.art_id)
+        STATE["dirty"] = 0.0
+        self.job = None
+        if self.resume_session and self.resume_session[0] == snapshot.session:
+            self.resume_session = None
+
+    def dispatch_once(self, now=None):
+        """Single worker iteration; separate method enables deterministic races."""
+        now = time.monotonic() if now is None else now
+        with AUDIO.lock:
+            work = self._select(now)
+            if work is None:
+                return False
+            kind, value = work
+            if kind == "playback":
+                stage = self.job[1]
+                # Cancellation/replacement can change selection between actions.
+                if not self._current(value):
+                    return False
+                name, args = (("SetAVTransportURI", self.uri_args(value)) if stage == "uri"
+                              else ("Play", "<Speed>1</Speed>"))
+            elif kind == "stop":
+                name, args = "Stop", ""
+            elif kind == "resume":
+                name, args = "Play", "<Speed>1</Speed>"
+            else:
+                name, args = "SetVolume", ("<Channel>Master</Channel>"
+                                           f"<DesiredVolume>{value[1]}</DesiredVolume>")
+        success = self.action(name, args, "RenderingControl" if kind == "volume" else "AVTransport")
+        with AUDIO.lock:
+            retry = self.retries[kind]
+            if not success:
+                if retry["failures"] < len(self.RETRY_DELAYS):
+                    retry["at"] = time.monotonic() + self.RETRY_DELAYS[retry["failures"]]
+                else:
+                    retry["exhausted"] = True
+                    log(f"renderer {name} retries exhausted; waiting for changed desired state")
+                retry["failures"] += 1
+                return True
+            retry.update(failures=0, at=0.0, exhausted=False)
+            if kind == "stop":
+                self.stopped_revision = value
+            elif kind == "volume" and self.volume == value:
+                self.volume = None
+            elif kind == "resume" and self.resume_session == value:
+                self.resume_session = None
+                if self.job and self.job[1] == "play" and self._current(self.job[0]):
+                    self._ack_playback(self.job[0])
+            elif kind == "playback" and self.job and self.job[0] == value:
+                if not self._current(value):
+                    self.job = None
+                elif stage == "uri":
+                    self.job = (value, "play")
+                else:
+                    self._ack_playback(value)
+        return True
+
+    def run(self):
+        while True:
+            self.dispatch_once()
+            time.sleep(0.05)
 
 
 # ---------------------------------------------------------- shairport metadata
@@ -719,6 +1051,11 @@ def _walk_dicts(obj):
 
 
 def handle_copl(data):
+    with AUDIO.lock:
+        _handle_copl_locked(data)
+
+
+def _handle_copl_locked(data):
     """AirPlay 2 sends now-playing info as 'copl' items: a binary plist with
     kMRMediaRemoteNowPlayingInfo* keys (title/artist/album/artwork). Frequent
     partial updates (elapsed time only) carry no title and are ignored."""
@@ -750,7 +1087,7 @@ def handle_copl(data):
             cache_art(ART["id"], art, ART["mime"])
             NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
                 STREAM_URL.rsplit("/", 1)[0], ART["id"])
-            STATE["dirty"] = time.time()
+            mark_metadata_dirty()
             log(f"artwork updated ({len(art)} bytes, {ART['mime']})")
 
     if isinstance(title, str) and title and (
@@ -758,7 +1095,7 @@ def handle_copl(data):
         NOW_PLAYING["title"] = title
         NOW_PLAYING["artist"] = artist if isinstance(artist, str) else ""
         NOW_PLAYING["album"] = album if isinstance(album, str) else ""
-        STATE["dirty"] = time.time()
+        mark_metadata_dirty()
         log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
 
 
@@ -770,15 +1107,17 @@ ITEM = re.compile(
 
 def handle_output_description(data, wiim):
     try:
-        changed = AUDIO.describe(data)
+        with AUDIO.lock:
+            changed = AUDIO.describe(data)
+            if changed:
+                STATE["pushed"] = None
+                mark_metadata_dirty()
     except ValueError as error:
-        AUDIO.fail(str(error))
+        with AUDIO.lock:
+            AUDIO.fail(str(error))
+            wiim.stop(AUDIO.session_id)
         drop_clients("invalid output description")
         log(f"odsc rejected: {error}; stopping renderer; {AUDIO.status()}")
-        wiim.stop()
-        return
-    if changed:
-        STATE.update(pushed=None, dirty=time.time())
 
 
 def handle_playback_metadata(code, data, wiim, pending):
@@ -792,40 +1131,28 @@ def handle_playback_metadata(code, data, wiim, pending):
                 pending.clear()
                 NOW_PLAYING.update(title="", artist="", album="", artwork="")
                 ART.update(bytes=b"", hash=None)
-                STATE.update(active=True, pushed=None, dirty=time.time())
+                STATE.update(active=True, pushed=None)
+                mark_metadata_dirty()
             else:
                 log(f"duplicate pbeg ignored; {AUDIO.status()}")
     elif code == "pend":
         with AUDIO.lock:
+            session_id = AUDIO.session_id
             AUDIO.end("pend received")
-            drop_clients("session end")
             pending.clear()
             NOW_PLAYING.update(title="", artist="", album="", artwork="")
             ART.update(bytes=b"", hash=None)
             STATE.update(active=False, dirty=0.0, pushed=None)
-        wiim.stop()
+            wiim.stop(session_id)
+        cancel_session_clients(session_id, "session end")
     else:
         return False
     return True
 
 
 def didl_pusher(wiim):
-    """single place that talks to the renderer transport: initial play and (debounced)
-    track-change DIDL refreshes; the player restarts the stream on each push"""
-    while True:
-        time.sleep(0.5)
-        if not STATE["active"] or not STATE["dirty"] or AUDIO.snapshot() is None:
-            continue
-        if time.time() - STATE["dirty"] < PUSH_SETTLE:
-            continue
-        snap = (NOW_PLAYING["title"], NOW_PLAYING["artist"], NOW_PLAYING["album"], ART["id"])
-        STATE["dirty"] = 0.0
-        if snap == STATE["pushed"]:
-            continue
-        if STATE["pushed"] is not None and not DIDL_PUSH:
-            continue    # initial play happened; mid-play refreshes disabled
-        STATE["pushed"] = snap
-        wiim.play(STREAM_URL)
+    """One renderer worker; metadata threads only publish desired state."""
+    wiim.run()
 
 
 def metadata_reader(wiim):
@@ -874,23 +1201,25 @@ def metadata_reader(wiim):
                             except (ValueError, IndexError):
                                 pass
                         elif typ == "ssnc" and code == "PICT" and data:
-                            h = hash(data)
-                            if h != ART["hash"]:
-                                ART.update(id=ART["id"] + 1, bytes=data, hash=h)
-                                cache_art(ART["id"], data, ART["mime"])
-                                NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
-                                    STREAM_URL.rsplit("/", 1)[0], ART["id"])
-                                STATE["dirty"] = time.time()
-                                log(f"artwork updated ({len(data)} bytes)")
+                            with AUDIO.lock:
+                                h = hash(data)
+                                if h != ART["hash"]:
+                                    ART.update(id=ART["id"] + 1, bytes=data, hash=h)
+                                    cache_art(ART["id"], data, ART["mime"])
+                                    NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
+                                        STREAM_URL.rsplit("/", 1)[0], ART["id"])
+                                    mark_metadata_dirty()
+                                    log(f"artwork updated ({len(data)} bytes)")
                         elif typ == "ssnc" and code == "mden":
-                            if pending.get("minm") and (
-                                    pending.get("minm") != NOW_PLAYING["title"] or
-                                    pending.get("asar", "") != NOW_PLAYING["artist"]):
-                                NOW_PLAYING["title"] = pending.get("minm", "")
-                                NOW_PLAYING["artist"] = pending.get("asar", "")
-                                NOW_PLAYING["album"] = pending.get("asal", "")
-                                STATE["dirty"] = time.time()
-                                log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
+                            with AUDIO.lock:
+                                if pending.get("minm") and (
+                                        pending.get("minm") != NOW_PLAYING["title"] or
+                                        pending.get("asar", "") != NOW_PLAYING["artist"]):
+                                    NOW_PLAYING["title"] = pending.get("minm", "")
+                                    NOW_PLAYING["artist"] = pending.get("asar", "")
+                                    NOW_PLAYING["album"] = pending.get("asal", "")
+                                    mark_metadata_dirty()
+                                    log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
                         elif typ == "ssnc" and code in ("pfls", "paus") and FLUSH_RESYNC:
                             # seek/pause: make the player discard stale buffered
                             # audio so it reacts at the new position promptly
@@ -898,12 +1227,19 @@ def metadata_reader(wiim):
                     # a partial cover-art item can be ~700KB of base64: keep enough tail
                     buf = buf[pos:] if pos else buf[-2097152:]
             log(f"metadata pipe EOF unparsed_bytes={len(buf)} last_event_seq={sequence}; {AUDIO.status()}")
-            AUDIO.end("metadata pipe EOF")
-            STATE.update(active=False, dirty=0.0, pushed=None)
-            drop_clients("metadata pipe closed")
+            with AUDIO.lock:
+                session_id, was_active = AUDIO.session_id, STATE["active"]
+                AUDIO.end("metadata pipe EOF")
+                STATE.update(active=False, dirty=0.0, pushed=None)
+                if was_active:
+                    wiim.stop(session_id)
+            cancel_session_clients(session_id, "metadata pipe closed")
         except Exception as e:
             log(f"metadata pipe error: {e}; last_event_seq={sequence}; {AUDIO.status()}")
-            AUDIO.fail("metadata pipe lost")
+            with AUDIO.lock:
+                AUDIO.fail("metadata pipe lost")
+                STATE.update(active=False, dirty=0.0, pushed=None)
+                wiim.stop(AUDIO.session_id)
             drop_clients("metadata pipe lost")
             time.sleep(1)
 

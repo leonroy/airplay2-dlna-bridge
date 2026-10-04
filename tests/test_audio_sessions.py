@@ -366,7 +366,8 @@ def test_fragmented_metadata_pipe_logs_source_output_and_session_order(bridge, m
 
 
 @pytest.mark.parametrize("format_state", ("unknown", "known", "rejected"))
-def test_audio_resume_requires_a_valid_description(bridge, monkeypatch, format_state):
+@pytest.mark.parametrize("active_client", (False, True))
+def test_audio_resume_requires_a_valid_description(bridge, monkeypatch, format_state, active_client):
     class Finished(BaseException):
         pass
 
@@ -381,18 +382,33 @@ def test_audio_resume_requires_a_valid_description(bridge, monkeypatch, format_s
     reader.fileno.return_value = 123
     monkeypatch.setattr(bridge.AUDIO, "attach_audio", Mock())
     monkeypatch.setattr(bridge.AUDIO, "detach_audio", Mock())
-    monkeypatch.setattr(bridge.AUDIO, "read_audio", Mock(side_effect=[(b"abcd", 1), (b"efgh", 1), Finished()]))
+    clock = Mock(return_value=10.0)
+    reads = iter((b"abcd", b"efgh"))
+    def read_audio(_):
+        try:
+            data = next(reads)
+        except StopIteration:
+            raise Finished()
+        clock.return_value += 3
+        return data, bridge.AUDIO.session_id
+    monkeypatch.setattr(bridge.AUDIO, "read_audio", read_audio)
     monkeypatch.setattr(bridge.select, "select", Mock())
     context = Mock()
     context.__enter__ = Mock(return_value=reader)
     context.__exit__ = Mock(return_value=False)
     monkeypatch.setattr(bridge, "open", Mock(return_value=context), raising=False)
-    monkeypatch.setattr(bridge.time, "time", Mock(side_effect=[10.0, 13.0]))
+    monkeypatch.setattr(bridge.time, "monotonic", clock)
+    monkeypatch.setattr(bridge, "has_active_clients", Mock(return_value=active_client))
     worker = Mock()
     monkeypatch.setattr(bridge.threading, "Thread", worker)
+    wiim = Mock()
     with pytest.raises(Finished):
-        bridge.audio_reader(Mock())
-    assert worker.call_count == (1 if format_state == "known" else 0)
+        bridge.audio_reader(wiim)
+    if format_state == "known" and not active_client:
+        wiim.resume.assert_called_once_with(bridge.AUDIO.session_id)
+    else:
+        wiim.resume.assert_not_called()
+    worker.assert_not_called()
 
 
 @pytest.mark.parametrize("order", (("pbeg", "odsc"), ("odsc", "pbeg")))
