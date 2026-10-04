@@ -20,6 +20,14 @@ PORT = int(os.environ.get("STREAM_PORT", "8000"))
 STREAM_URL = os.environ.get("STREAM_URL", "")
 RENDERER_IP = os.environ.get("RENDERER_IP") or os.environ.get("WIIM_IP", "")
 MAX_VOLUME = int(os.environ.get("MAX_VOLUME", "100"))
+HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", "16"))
+FLAC_MAX_ENCODERS = int(os.environ.get("FLAC_MAX_ENCODERS", "4"))
+HTTP_HEADER_TIMEOUT = int(os.environ.get("HTTP_HEADER_TIMEOUT", "5"))
+HTTP_HEADER_DEADLINE = int(os.environ.get("HTTP_HEADER_DEADLINE", "10"))
+if min(HTTP_MAX_CONNECTIONS, FLAC_MAX_ENCODERS,
+       HTTP_HEADER_TIMEOUT, HTTP_HEADER_DEADLINE) <= 0:
+    raise ValueError("HTTP/encoder limits and header timeouts must be positive integers")
+ENCODER_SLOTS = threading.BoundedSemaphore(FLAC_MAX_ENCODERS)
 
 ICY_META_INT = 131072               # same interval airupnp uses
 RING_SECONDS = 12
@@ -519,8 +527,90 @@ def wav_header(pcm):
     return pcm.wav_header()
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Reserve accepted-connection capacity before creating a handler thread."""
+    def __init__(self, address, handler, *, max_connections=HTTP_MAX_CONNECTIONS):
+        if max_connections <= 0:
+            raise ValueError("max_connections must be positive")
+        self.connection_slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.connection_slots.acquire(blocking=False):
+            # No handler thread or parsing for overload; bound this small write
+            # so a peer refusing to read cannot stall the accept loop.
+            try:
+                request.settimeout(STREAM_POLL_SECONDS)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\n"
+                                b"Connection: close\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
+
+
 class StreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(HTTP_HEADER_TIMEOUT)
+
+    def _expire_headers(self):
+        # An inactivity timeout alone lets a trickling request retain a thread
+        # indefinitely. Shutdown interrupts even a buffered readline in progress.
+        self._headers_expired.set()
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _finish_headers(self):
+        self._header_timer.cancel()
+        self._header_timer.join()
+        self.connection.settimeout(STREAM_WRITE_TIMEOUT)
+
+    def handle_one_request(self):
+        self.connection.settimeout(HTTP_HEADER_TIMEOUT)
+        self._headers_expired = threading.Event()
+        self._header_timer = threading.Timer(HTTP_HEADER_DEADLINE, self._expire_headers)
+        self._header_timer.daemon = True
+        self._header_timer.start()
+        try:
+            super().handle_one_request()
+        except OSError:
+            self.close_connection = True
+        finally:
+            self._finish_headers()
+
+    def parse_request(self):
+        if self._headers_expired.is_set():
+            self.close_connection = True
+            return False
+        try:
+            parsed = super().parse_request()
+        finally:
+            # Cancel and join before do_GET: the header deadline must never
+            # terminate an otherwise healthy stream or a long playback pause.
+            self._finish_headers()
+        # EOF produced by shutdown can look like a complete HTTP/0.9 request
+        # or end-of-headers to the stdlib parser. Never dispatch expired input.
+        if self._headers_expired.is_set():
+            self.close_connection = True
+            return False
+        return parsed
 
     def log_message(self, fmt, *args):
         log(f"http {self.address_string()} {fmt % args}")
@@ -605,7 +695,11 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_error(503, "Waiting for a valid Shairport output description")
             return
         client = StreamClient(ring, self.connection)
-        register_client(client)
+        encoder_slots = ENCODER_SLOTS
+        if not encoder_slots.acquire(blocking=False):
+            log(f"flac request rejected HTTP=503; encoder capacity={FLAC_MAX_ENCODERS}")
+            self.send_error(503, "FLAC encoder capacity exhausted")
+            return
         def feeder():
             pos = ring.join_pos()
             try:
@@ -622,6 +716,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         try:
+            register_client(client)
             if client.cancelled.is_set():
                 return
             # Spawn before acknowledging success, and own it even if headers or
@@ -671,8 +766,8 @@ class StreamHandler(BaseHTTPRequestHandler):
         except (StreamEnded, BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
             log(f"flac client {self.address_string()} disconnected session={ring.session_id}")
         finally:
-            client.wake()
             try:
+                client.wake()
                 enc = client.encoder
                 if enc is not None:
                     result = enc.poll()
@@ -690,7 +785,10 @@ class StreamHandler(BaseHTTPRequestHandler):
                     enc.stdout.close()
                 log(f"flac stream closed session={ring.session_id} ring_closed={ring.closed}")
             finally:
-                unregister_client(client)
+                try:
+                    unregister_client(client)
+                finally:
+                    encoder_slots.release()
 
     @staticmethod
     def icy_block(last):
@@ -1256,7 +1354,7 @@ def main():
     threading.Thread(target=audio_reader, args=(wiim,), daemon=True).start()
     threading.Thread(target=metadata_reader, args=(wiim,), daemon=True).start()
     log(f"serving FLAC+ICY on :{PORT}/stream.flac (diagnostic WAV on /stream.wav)")
-    ThreadingHTTPServer(("", PORT), StreamHandler).serve_forever()
+    BoundedHTTPServer(("", PORT), StreamHandler).serve_forever()
 
 
 if __name__ == "__main__":

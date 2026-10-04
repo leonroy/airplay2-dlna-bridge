@@ -30,6 +30,11 @@ services:
       - STREAM_URL=http://${HOST_IP:?set HOST_IP in .env}:${STREAM_PORT:-8000}/stream.flac
       # phone full volume maps to this renderer hardware volume (protect ears/speakers)
       - MAX_VOLUME=${MAX_VOLUME:-100}
+      # Bound admitted HTTP handlers and FLAC processes, preserving reconnect overlap.
+      - HTTP_MAX_CONNECTIONS=${HTTP_MAX_CONNECTIONS:-16}
+      - FLAC_MAX_ENCODERS=${FLAC_MAX_ENCODERS:-4}
+      - HTTP_HEADER_TIMEOUT=${HTTP_HEADER_TIMEOUT:-5}
+      - HTTP_HEADER_DEADLINE=${HTTP_HEADER_DEADLINE:-10}
       # push track title/artist/album/artwork to the renderer's display on track change
       # (the player restarts the stream on each push: ~2-4s gap per track; 0 = off)
       - DIDL_PUSH=${DIDL_PUSH:-1}
