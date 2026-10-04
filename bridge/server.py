@@ -10,6 +10,7 @@
   now-playing DIDL pushes on the renderer
 """
 import base64, collections, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 from xml.etree import ElementTree
@@ -418,6 +419,11 @@ DIDL_PUSH = os.environ.get("DIDL_PUSH", "1") == "1"
 # audio and reconnects at the new position (faster reaction to phone actions)
 FLUSH_RESYNC = os.environ.get("FLUSH_RESYNC", "1") == "1"
 PUSH_SETTLE = 2.0
+# Faster initial metadata scheduling is opt-in until measured on the renderer.
+# Require a real title, and preserve the ordinary debounce for later updates.
+STARTUP_SETTLE = float(os.environ.get("STARTUP_SETTLE", str(PUSH_SETTLE)))
+if not math.isfinite(STARTUP_SETTLE) or not 0.1 <= STARTUP_SETTLE <= PUSH_SETTLE:
+    raise ValueError("STARTUP_SETTLE must be between 0.1 and 2.0 seconds")
 STATE = {"active": False, "dirty": 0.0, "pushed": None, "revision": 0}
 
 
@@ -425,6 +431,50 @@ def mark_metadata_dirty():
     """Call under AUDIO.lock; revisions prevent stale completions losing updates."""
     STATE["revision"] += 1
     STATE["dirty"] = time.monotonic()
+
+
+def log_timing(event, session, revision, **fields):
+    """One bounded event record; never include metadata or audio payloads."""
+    detail = " ".join(f"{key}={value}" for key, value in fields.items())
+    log(f"timing event={event} session={session} revision={revision} {detail}")
+
+
+class FlacFrameProbe:
+    """Find the first frame sync after metadata, retaining at most four bytes."""
+    def __init__(self):
+        self.phase, self.remaining, self.last = "marker", 0, False
+        self.header = bytearray()
+
+    def feed(self, data):
+        offset = 0
+        while offset < len(data) and self.phase not in ("done", "invalid"):
+            if self.phase == "body":
+                count = min(self.remaining, len(data) - offset)
+                self.remaining -= count
+                offset += count
+                if self.remaining == 0:
+                    self.phase = "frame" if self.last else "block"
+                continue
+            size = 2 if self.phase == "frame" else 4
+            count = min(size - len(self.header), len(data) - offset)
+            self.header.extend(data[offset:offset + count])
+            offset += count
+            if len(self.header) < size:
+                continue
+            if self.phase == "marker":
+                self.phase = "block" if self.header == b"fLaC" else "invalid"
+            elif self.phase == "block":
+                self.last = bool(self.header[0] & 0x80)
+                self.remaining = int.from_bytes(self.header[1:], "big")
+                self.phase = ("body" if self.remaining else
+                              "frame" if self.last else "block")
+            else:
+                valid = self.header[0] == 0xff and self.header[1] & 0xfe == 0xf8
+                self.phase = "done" if valid else "invalid"
+                self.header.clear()
+                return valid
+            self.header.clear()
+        return False
 
 
 CLIENTS = set()          # StreamClient records, including cleanup in progress
@@ -599,19 +649,27 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     # ---- main endpoint: FLAC + ICY, the combo airupnp uses on the WiiM ----
     def serve_flac(self):
-        ring = AUDIO.snapshot()
+        requested_at = time.monotonic()
+        with AUDIO.lock:
+            ring, revision = AUDIO.snapshot(), STATE["revision"]
         if ring is None:
             log(f"flac request rejected HTTP=503; {AUDIO.status()}")
             self.send_error(503, "Waiting for a valid Shairport output description")
             return
         client = StreamClient(ring, self.connection)
         register_client(client)
+        first_pcm_at = None
         def feeder():
+            nonlocal first_pcm_at
             pos = ring.join_pos()
             try:
                 while not client.cancelled.is_set():
                     pos, data = ring.read_from(pos, cancel=client.cancelled)
                     if data:
+                        if first_pcm_at is None:
+                            first_pcm_at = time.monotonic()
+                            log_timing("flac_pcm", ring.session_id, revision,
+                                       request_ms=round((first_pcm_at - requested_at) * 1000, 1))
                         client.encoder.stdin.write(data)
                         client.encoder.stdin.flush()
             except (StreamEnded, BrokenPipeError, OSError):
@@ -640,11 +698,14 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.connection.settimeout(STREAM_POLL_SECONDS)
             log(f"flac client {self.address_string()} connected (icy={icy}) "
                 f"session={ring.session_id} pcm={ring.pcm.description}")
+            log_timing("flac_connected", ring.session_id, revision,
+                       request_ms=round((time.monotonic() - requested_at) * 1000, 1))
             fd = client.encoder.stdout.fileno()
             os.set_blocking(fd, False)
             client.feeder = threading.Thread(target=feeder, daemon=True)
             client.feeder.start()
             sent_since_meta, last_meta = 0, None
+            frame_probe = FlacFrameProbe()
             while not client.cancelled.is_set() and not ring.closed:
                 client.check()
                 ready, _, _ = select.select([fd], [], [], STREAM_POLL_SECONDS)
@@ -656,6 +717,12 @@ class StreamHandler(BaseHTTPRequestHandler):
                     continue
                 if not data:
                     break
+                if frame_probe.feed(data):
+                    emitted_at = time.monotonic()
+                    log_timing("flac_frame", ring.session_id, revision,
+                               request_ms=round((emitted_at - requested_at) * 1000, 1),
+                               pcm_ms=(round((emitted_at - first_pcm_at) * 1000, 1)
+                                       if first_pcm_at is not None else "none"))
                 if not icy:
                     self.write_stream(client, data)
                     continue
@@ -933,6 +1000,12 @@ class Renderer:
             retry = self.retries[kind] = dict(value=value, failures=0, at=0.0, exhausted=False)
         return not retry["exhausted"] and now >= retry["at"]
 
+    @staticmethod
+    def _settle():
+        if STATE["pushed"] is None and NOW_PLAYING["title"]:
+            return STARTUP_SETTLE
+        return PUSH_SETTLE
+
     def _select(self, now):
         """Coalesce work under AUDIO.lock; independent backoffs cannot monopolize it."""
         if self.stop_revision != self.stopped_revision:
@@ -948,7 +1021,7 @@ class Renderer:
         if self.job and not self._current(self.job[0]):
             self.job = None
         if not self.job and (STATE["active"] and AUDIO.snapshot() is not None and STATE["dirty"]
-                             and now - STATE["dirty"] >= PUSH_SETTLE):
+                             and now - STATE["dirty"] >= self._settle()):
             snapshot = PlaybackSnapshot(AUDIO.session_id, STATE["revision"],
                                        NOW_PLAYING["title"], NOW_PLAYING["artist"],
                                        NOW_PLAYING["album"], ART["id"], bool(ART["bytes"]),
@@ -958,6 +1031,10 @@ class Renderer:
                 STATE["dirty"] = 0.0
             else:
                 self.job = (snapshot, "uri")
+                log_timing("playback_ready", snapshot.session, snapshot.revision,
+                           reason="initial" if STATE["pushed"] is None else "refresh",
+                           settle_ms=round(self._settle() * 1000, 1),
+                           dirty_ms=round((now - STATE["dirty"]) * 1000, 1))
         if self.job and self._eligible("playback", (self.job[0], self.resume_revision), now):
             return ("playback", self.job[0])
         if self.resume_session is not None:
@@ -1004,7 +1081,17 @@ class Renderer:
             else:
                 name, args = "SetVolume", ("<Channel>Master</Channel>"
                                            f"<DesiredVolume>{value[1]}</DesiredVolume>")
+            session = value.session if kind == "playback" else (
+                self.stop_session if kind == "stop" else value[0])
+            revision = value.revision if kind == "playback" else (
+                value if kind == "stop" else value[-1])
+            attempt = self.retries[kind]["failures"] + 1
+        started_at = time.monotonic()
+        log_timing("command_start", session, revision, kind=kind, action=name, attempt=attempt)
         success = self.action(name, args, "RenderingControl" if kind == "volume" else "AVTransport")
+        log_timing("command_end", session, revision, kind=kind, action=name, attempt=attempt,
+                   result="success" if success else "failure",
+                   duration_ms=round((time.monotonic() - started_at) * 1000, 1))
         with AUDIO.lock:
             retry = self.retries[kind]
             if not success:

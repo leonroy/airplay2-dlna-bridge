@@ -129,6 +129,48 @@ docker compose logs --timestamps --follow bridge shairport-sync
 
 While audio waits for `odsc`, buffer status is logged at most every five seconds.
 
+Playback timing records use `timing event=... session=... revision=...`. They
+report `playback_ready` (the metadata quiet period has elapsed),
+`command_start`/`command_end` (action, attempt, SOAP result and duration),
+`flac_connected`, the first `flac_pcm` feed and the first `flac_frame` sync after
+complete FLAC metadata. The FLAC events report milliseconds from the HTTP
+request; `flac_frame` also reports time from the first PCM feed. They occur once
+per connection, without titles, artwork or PCM payloads. Command success means
+a valid SOAP response, not audible playback. Frame detection precedes writing
+to the socket and does not measure renderer buffering or audible sound.
+Playback command revisions identify metadata snapshots; Stop, volume and resume
+use their own command revisions. A FLAC connection records the metadata
+revision observed when the request arrived, which can differ from the URI's
+revision if metadata changed meanwhile. Session IDs reset on bridge restart.
+
+### Testing faster initial playback
+
+`STARTUP_SETTLE` defaults to `2.0` seconds and accepts `0.1`–`2.0`. To test a
+shorter initial metadata quiet period, set `STARTUP_SETTLE=0.5` in `.env` and
+recreate only the bridge container. This is an opt-in experiment: the collected
+live baseline measures mid-play metadata refreshes, not initial playback, so it
+does not establish a startup gain. The bridge still requires `pbeg` and a valid
+`odsc`, and uses the shorter interval only when a nonempty title is available.
+Title-less startup retains the ordinary two-second fallback. Each changed
+title/artwork event restarts the quiet period; identical updates do not.
+
+All later display updates retain the two-second debounce, and `DIDL_PUSH=0`
+still sends one initial URI with no display refreshes. Artwork arriving after
+the initial quiet period can require another URI and stream restart with
+`DIDL_PUSH=1`; metadata arriving during an in-flight URI cancels the stale Play
+and schedules the latest snapshot. A shorter interval can therefore increase
+restarts for senders with late metadata. FFmpeg flags, PCM samples and stream
+backlog are unchanged.
+
+Before merging, compare the same sender, track and renderer with `2.0` and
+`0.5`, testing each AirPlay bridge separately. Repeat cold playback, sender
+takeover and late artwork; also check track changes, pause/resume and seeking.
+Record sender-button and audible-start times externally, then correlate session
+logs from `pbeg`/`odsc` through `playback_ready`, each URI/Play command and
+`flac_frame`. Count URI sends and reconnects as well as delay. Accept the faster
+setting only if initial playback improves without additional restarts or
+regressions; restore `STARTUP_SETTLE=2.0` to restore the original scheduler.
+
 
 ## Display updates and the track-change gap
 
