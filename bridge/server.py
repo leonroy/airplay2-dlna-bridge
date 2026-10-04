@@ -10,7 +10,6 @@
   now-playing DIDL pushes on the renderer
 """
 import base64, collections, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
-import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 from xml.etree import ElementTree
@@ -419,11 +418,7 @@ DIDL_PUSH = os.environ.get("DIDL_PUSH", "1") == "1"
 # audio and reconnects at the new position (faster reaction to phone actions)
 FLUSH_RESYNC = os.environ.get("FLUSH_RESYNC", "1") == "1"
 PUSH_SETTLE = 2.0
-# Faster initial metadata scheduling is opt-in until measured on the renderer.
-# Require a real title, and preserve the ordinary debounce for later updates.
-STARTUP_SETTLE = float(os.environ.get("STARTUP_SETTLE", str(PUSH_SETTLE)))
-if not math.isfinite(STARTUP_SETTLE) or not 0.1 <= STARTUP_SETTLE <= PUSH_SETTLE:
-    raise ValueError("STARTUP_SETTLE must be between 0.1 and 2.0 seconds")
+INITIAL_PUSH_SETTLE = 0.5           # initial playback with a real title
 STATE = {"active": False, "dirty": 0.0, "pushed": None, "revision": 0}
 
 
@@ -1003,7 +998,7 @@ class Renderer:
     @staticmethod
     def _settle():
         if STATE["pushed"] is None and NOW_PLAYING["title"]:
-            return STARTUP_SETTLE
+            return INITIAL_PUSH_SETTLE
         return PUSH_SETTLE
 
     def _select(self, now):

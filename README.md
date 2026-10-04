@@ -114,7 +114,7 @@ and the renderer's stream restart on display updates remain separate sources of
 latency. The exact deployment image digest recorded in the maintenance handoff
 (`sha256:8d9c2c694d1fa3dc05b45921ac8da646e342ec75b7387302b888c8cbcb2359c2`)
 also contains FFmpeg 8.1.2 and showed the same result in local ARM64 tests.
-The live server was not inspected during these measurements.
+The AMD64 test server also runs FFmpeg 8.1.2; probe changes were omitted.
 
 ### Diagnosing format metadata
 
@@ -143,14 +143,11 @@ use their own command revisions. A FLAC connection records the metadata
 revision observed when the request arrived, which can differ from the URI's
 revision if metadata changed meanwhile. Session IDs reset on bridge restart.
 
-### Testing faster initial playback
+### Initial playback timing
 
-`STARTUP_SETTLE` defaults to `2.0` seconds and accepts `0.1`–`2.0`. To test a
-shorter initial metadata quiet period, set `STARTUP_SETTLE=0.5` in `.env` and
-recreate only the bridge container. This is an opt-in experiment: the collected
-live baseline measures mid-play metadata refreshes, not initial playback, so it
-does not establish a startup gain. The bridge still requires `pbeg` and a valid
-`odsc`, and uses the shorter interval only when a nonempty title is available.
+Initial playback uses a fixed **0.5-second** metadata quiet period. The bridge
+still requires `pbeg` and a valid `odsc`, and uses the shorter interval only
+when a nonempty title is available. There is no configuration toggle.
 Title-less startup retains the ordinary two-second fallback. Each changed
 title/artwork event restarts the quiet period; identical updates do not.
 
@@ -162,14 +159,22 @@ and schedules the latest snapshot. A shorter interval can therefore increase
 restarts for senders with late metadata. FFmpeg flags, PCM samples and stream
 backlog are unchanged.
 
-Before merging, compare the same sender, track and renderer with `2.0` and
-`0.5`, testing each AirPlay bridge separately. Repeat cold playback, sender
-takeover and late artwork; also check track changes, pause/resume and seeking.
-Record sender-button and audible-start times externally, then correlate session
-logs from `pbeg`/`odsc` through `playback_ready`, each URI/Play command and
-`flac_frame`. Count URI sends and reconnects as well as delay. Accept the faster
-setting only if initial playback improves without additional restarts or
-regressions; restore `STARTUP_SETTLE=2.0` to restore the original scheduler.
+Live AMD64 tests compared three fresh starts with the previous two-second
+interval and five with the half-second interval. Median `odsc` acceptance to
+first FLAC frame improved from **2.391 to 0.871 seconds**; median `pbeg` to first
+frame improved from **3.285 to 1.694 seconds**. All trials used S32/48 kHz stereo,
+but tracks differed between the baseline and faster trials. No command failures
+or artwork-only extra initial resets were observed. Four faster trials used one
+URI and one FLAC connection; the fifth's two additional refreshes followed
+actual title changes and retained the two-second mid-play debounce.
+
+These are small-sample results from one sender/renderer setup, and frame sync
+is measured before socket writing, not at audible output. When testing another
+setup, repeat cold playback, sender takeover and late artwork; also check track
+changes, pause/resume and seeking. Record sender-button and audible-start times
+externally, then correlate session logs from `pbeg`/`odsc` through
+`playback_ready`, each URI/Play command and `flac_frame`. Count URI sends and
+reconnects alongside delay.
 
 
 ## Display updates and the track-change gap

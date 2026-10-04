@@ -10,7 +10,6 @@ import pytest
 def startup(bridge, monkeypatch):
     now = [100.0]
     monkeypatch.setattr(bridge.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(bridge, "STARTUP_SETTLE", 0.5)
     monkeypatch.setattr(bridge, "cancel_session_clients", lambda *_: None)
     renderer = bridge.Renderer("127.0.0.1")
     renderer.action = Mock(return_value=True)
@@ -135,17 +134,20 @@ def test_late_art_after_success_keeps_mid_play_debounce(bridge, startup, monkeyp
     assert names(renderer) == ["SetAVTransportURI", "Play"] * (2 if didl else 1)
 
 
-def test_default_still_waits_two_seconds(bridge, startup, monkeypatch):
+def test_mid_play_title_change_still_waits_two_seconds(bridge, startup):
     renderer, event, metadata, step = startup
-    monkeypatch.setattr(bridge, "STARTUP_SETTLE", 2.0)
     event("pbeg")
     event("odsc", b"44100/S16_LE/2")
     metadata("Title", at=100.1)
-    assert not step(100.6)
-    assert not step(102.09)
-    assert step(102.11)
-    assert step(102.16)
-    assert names(renderer) == ["SetAVTransportURI", "Play"]
+    assert step(100.61)
+    assert step(100.66)
+    metadata("Next title", at=101)
+    assert not step(101.5)
+    assert not step(102.99)
+    assert step(103)
+    assert step(103.05)
+    assert names(renderer) == ["SetAVTransportURI", "Play"] * 2
+    assert bridge.STATE["pushed"][0] == "Next title"
 
 
 def test_update_during_uri_cancels_stale_play_and_coalesces_retry(bridge, startup):

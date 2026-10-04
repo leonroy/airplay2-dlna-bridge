@@ -33,8 +33,6 @@ services:
       # push track title/artist/album/artwork to the renderer's display on track change
       # (the player restarts the stream on each push: ~2-4s gap per track; 0 = off)
       - DIDL_PUSH=${DIDL_PUSH:-1}
-      # Opt-in shorter initial title/artwork quiet period; later updates stay at 2 s
-      - STARTUP_SETTLE=${STARTUP_SETTLE:-2.0}
       # EXPERIMENTAL, off by default: on seek/pause, drop the stream so the player
       # discards stale buffered audio (found to stall WiiM playback after seeks -
       # it treats the connection reset as fatal and needs a Play kick to recover)
