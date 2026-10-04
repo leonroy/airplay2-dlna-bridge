@@ -209,6 +209,47 @@ def test_encoder_exhaustion_rejects_without_spawning_and_cancellation_recovers(
     assert len(launches) == 2
 
 
+def test_timing_probes_preserve_encoder_capacity_and_cancellation(
+        bridge, monkeypatch, http_server):
+    monkeypatch.setattr(bridge, "ENCODER_SLOTS", threading.BoundedSemaphore(1))
+    bridge.AUDIO.begin()
+    bridge.AUDIO.describe("44100/S16_LE/2")
+    with bridge.AUDIO.lock:
+        bridge.STATE["revision"] = 7
+    ring = bridge.AUDIO.snapshot()
+    entered = threading.Event()
+    read_from = ring.read_from
+
+    def read(*args, **kwargs):
+        entered.set()
+        return read_from(*args, **kwargs)
+
+    monkeypatch.setattr(ring, "read_from", read)
+    server = http_server()
+    first = server.connect(b"GET /stream.flac HTTP/1.0\r\n\r\n")
+    assert response_headers(first).startswith(b"HTTP/1.0 200")
+    assert entered.wait(3)
+    # Feed enough PCM for both the current and older FFmpeg probing behavior.
+    ring.write(b"\x01\x00\x02\x00" * (44100 * 6))
+
+    def timing_records(event):
+        return [call.args[0] for call in bridge.log.call_args_list
+                if call.args[0].startswith(f"timing event={event} ")]
+
+    wait_until(lambda: timing_records("flac_frame"))
+    excess = server.connect(b"GET /stream.flac HTTP/1.0\r\n\r\n")
+    assert response_headers(excess).startswith(b"HTTP/1.0 503")
+    for event in ("flac_connected", "flac_pcm", "flac_frame"):
+        records = timing_records(event)
+        assert len(records) == 1
+        assert "session=1 revision=7 request_ms=" in records[0]
+    assert "pcm_ms=" in timing_records("flac_frame")[0]
+    bridge.cancel_all_clients("combined probe recovery")
+    wait_until(lambda: not bridge.CLIENTS and server.active == 0)
+    retry = server.connect(b"GET /stream.flac HTTP/1.0\r\n\r\n")
+    assert response_headers(retry).startswith(b"HTTP/1.0 200")
+
+
 @pytest.mark.parametrize("failure", ["spawn", "early_exit", "headers", "feeder"])
 def test_encoder_permit_recovers_after_startup_failures(
         bridge, monkeypatch, http_server, failure):
