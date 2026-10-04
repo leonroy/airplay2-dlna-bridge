@@ -1,0 +1,9 @@
+# Use with docker-compose.yml in a separate Compose project.
+# Set STREAM_PORT=8001 in that project's .env to avoid the AP2 stream port.
+services:
+  shairport-sync:
+    container_name: shairport-sync-airplay1
+    command: ["--service-type=classic", "-a", "AirPlay 1 Bridge", "-p", "5000", "-c", "/etc/shairport-sync.conf"]
+
+  bridge:
+    container_name: airplay1-bridge
