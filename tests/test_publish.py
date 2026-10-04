@@ -1,7 +1,9 @@
 import importlib.util
 import json
 from pathlib import Path
+import runpy
 import subprocess
+from unittest.mock import Mock
 
 import pytest
 
@@ -193,3 +195,24 @@ def test_existing_version_retry_smokes_children_and_keeps_index_for_latest(publi
         ('linux/arm64', f'{publisher.IMAGE}@{CHILD_DIGESTS["arm64"]}'),
     ]
     assert latest == [('0.1.1', DIGEST)]
+
+
+@pytest.mark.integration
+def test_cached_smoke_program_accepts_legacy_bridge_and_checks_samples(publisher, monkeypatch, capsys):
+    program_path = Path(__file__).parents[1] / ".github/scripts/docker_smoke.py"
+    program = publisher.SMOKE_PROGRAM  # Cached before switching release source.
+    legacy_source = '''import subprocess
+def encode():
+    subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
+        "-c:a", "flac", "-compression_level", "0", "-flush_packets", "1",
+        "-f", "flac", "pipe:1"])
+'''
+    legacy_bridge = {}
+    exec(compile(legacy_source, "legacy_server.py", "exec"), legacy_bridge)
+    monkeypatch.setattr(runpy, "run_path", Mock(return_value=legacy_bridge))
+    monkeypatch.setattr(Path, "read_text", Mock(return_value=legacy_source))
+    with pytest.raises(SystemExit) as exit_result:
+        exec(compile(program, str(program_path), "exec"), {"__file__": str(program_path)})
+    assert exit_result.value.code == 0
+    assert "Legacy bridge import and exact PCM/FLAC round trip passed" in capsys.readouterr().out

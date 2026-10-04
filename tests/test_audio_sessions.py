@@ -1,83 +1,12 @@
-"""PCM descriptions and sessions, including actual sample-preserving encoders."""
+"""Playback ordering, pipe boundaries, HTTP gating and diagnostic logs."""
 import base64
 import os
-from pathlib import Path
-import runpy
-import shutil
-import struct
-import subprocess
 import threading
 from unittest.mock import Mock
 
 import pytest
 
-
-FORMATS = {
-    "S8": (1, 8), "U8": (1, 8),
-    "S16_LE": (2, 16), "S16_BE": (2, 16),
-    "S24_LE": (4, 24), "S24_BE": (4, 24),
-    "S24_3LE": (3, 24), "S24_3BE": (3, 24),
-    "S32_LE": (4, 32), "S32_BE": (4, 32),
-}
-
-
-def samples(format, channels=2, frames=8192):
-    """Build Shairport wire bytes and independent packed WAV/FFmpeg expectations."""
-    storage, bits = FORMATS[format]
-    extremes = (-(1 << (bits - 1)), -1, 0, 1, (1 << (bits - 1)) - 1)
-    values = [extremes[i % len(extremes)] for i in range(frames * channels)]
-    source, canonical = bytearray(), bytearray()
-    for value in values:
-        if bits == 8:
-            source.append((value + 128) if format == "U8" else (value & 255))
-            canonical.append(value + 128)
-            continue
-        packed = value.to_bytes(bits // 8, "little", signed=True)
-        canonical.extend(packed)
-        # Shairport's S24_LE/BE have a zero padding byte even for negative values.
-        padded = packed + b"\x00" if bits == 24 and storage == 4 else packed
-        source.extend(padded[::-1] if format.endswith("BE") else padded)
-    return bytes(source), bytes(canonical)
-
-
-@pytest.mark.parametrize("format", FORMATS)
-@pytest.mark.parametrize("rate", (44100, 48000))
-def test_description_and_header(bridge, format, rate):
-    pcm = bridge.PCMFormat.from_description(f"{rate}/{format}/2".encode())
-    storage, bits = FORMATS[format]
-    assert pcm.source_frame == 2 * storage
-    assert pcm.frame == 2 * bits // 8
-    fields = struct.unpack("<IHHIIHH", pcm.wav_header()[16:36])
-    assert fields == (16, 1, 2, rate, rate * pcm.frame, pcm.frame, bits)
-    with pytest.raises(AttributeError):
-        pcm.rate = 96000
-
-
-@pytest.mark.parametrize("description", (
-    b"", b"48000/S16_LE", b"48000/S16_LE/2/extra", b"48000/S16_LE/2\n",
-    b"auto/S16_LE/2", b"48000/auto/2", b"48000/F24/2", b"48000/S64_LE/2",
-    b"0/S16_LE/2", b"12345/S16_LE/2", b"48000/S16_LE/0", b"48000/S16_LE/8",
-    b"48000/S16_LE/2\xff", None, 48000,
-))
-def test_bad_description_is_rejected(bridge, description):
-    with pytest.raises(ValueError):
-        bridge.PCMFormat.from_description(description)
-
-
-@pytest.mark.parametrize("format", FORMATS)
-def test_partial_input_reads_preserve_frames_and_values(bridge, format):
-    source, expected = samples(format, frames=32)
-    audio = bridge.AudioStream()
-    audio.begin()
-    # Audio and metadata use separate pipes, so first audio can arrive before odsc.
-    audio.feed(source[:7])
-    assert audio.snapshot() is None
-    audio.describe(f"48000/{format}/2")
-    for start in range(7, len(source), 17):
-        audio.feed(source[start:start + 17])
-    _, received = audio.snapshot().read_from(0)
-    assert received == expected
-    assert not audio.pending
+from audio_helpers import samples
 
 
 @pytest.mark.parametrize("order", ("description_first", "begin_first"))
@@ -126,17 +55,17 @@ def test_ended_session_tail_is_not_buffered_for_next_format(bridge):
 
 
 @pytest.mark.parametrize("metadata_before_eof_read", (False, True))
-def test_old_audio_eof_cleanup_preserves_new_metadata_session(bridge, monkeypatch, metadata_before_eof_read):
+def test_old_audio_eof_cleanup_preserves_new_metadata_session(bridge, monkeypatch, metadata_before_eof_read, audio_pipe):
     class Finished(BaseException):
         pass
 
     wiim, pending, next_ring = Mock(), {}, []
     bridge.handle_playback_metadata("pbeg", b"", wiim, pending)
     bridge.handle_playback_metadata("odsc", b"44100/S16_LE/2", wiim, pending)
-    read_fd, write_fd = os.pipe()
-    os.write(write_fd, b"old!")
-    os.close(write_fd)
-    reader = os.fdopen(read_fd, "rb", buffering=0)
+    pipe = audio_pipe()
+    pipe.write(b"old!")
+    pipe.close_writer()
+    reader = os.fdopen(os.dup(pipe.read_fd), "rb", buffering=0)
     context = Mock()
     context.__enter__ = Mock(return_value=reader)
 
@@ -172,94 +101,74 @@ def test_old_audio_eof_cleanup_preserves_new_metadata_session(bridge, monkeypatc
 
 
 @pytest.mark.parametrize("order", (("pbeg", "odsc"), ("odsc", "pbeg")))
-def test_persistent_audio_writer_is_drained_at_pend_without_eof(bridge, order):
-    read_fd, write_fd = os.pipe()
+def test_persistent_audio_writer_is_drained_at_pend_without_eof(bridge, order, audio_pipe):
+    pipe = audio_pipe(bridge.AUDIO)
     audio = bridge.AUDIO
     wiim, pending = Mock(), {}
-    try:
-        audio.attach_audio(read_fd)
-        bridge.handle_playback_metadata("pbeg", b"", wiim, pending)
-        bridge.handle_playback_metadata("odsc", b"44100/S16_LE/2", wiim, pending)
-        os.write(write_fd, b"old!")
-        audio.read_audio(read_fd)
-        old_ring = audio.snapshot()
-        os.write(write_fd, b"old-tail")
-        bridge.handle_playback_metadata("pend", b"", wiim, pending)
-        assert old_ring.closed
-        assert audio.read_audio(read_fd)[0] is None  # Empty, writer still open.
-        for code in order:
-            bridge.handle_playback_metadata(code, b"48000/S24_3LE/2" if code == "odsc" else b"",
-                                            wiim, pending)
-        source, expected = samples("S24_3LE", frames=8)
-        os.write(write_fd, source)
-        audio.read_audio(read_fd)
-        assert audio.snapshot().read_from(0)[1] == expected
-        assert not audio.pending  # In particular, no two-byte old-format offset.
-    finally:
-        audio.detach_audio(read_fd)
-        os.close(read_fd)
-        os.close(write_fd)
+    audio.attach_audio(pipe.read_fd)
+    bridge.handle_playback_metadata("pbeg", b"", wiim, pending)
+    bridge.handle_playback_metadata("odsc", b"44100/S16_LE/2", wiim, pending)
+    pipe.write(b"old!")
+    audio.read_audio(pipe.read_fd)
+    old_ring = audio.snapshot()
+    pipe.write(b"old-tail")
+    bridge.handle_playback_metadata("pend", b"", wiim, pending)
+    assert old_ring.closed
+    assert audio.read_audio(pipe.read_fd)[0] is None  # Empty, writer still open.
+    for code in order:
+        bridge.handle_playback_metadata(code, b"48000/S24_3LE/2" if code == "odsc" else b"",
+                                        wiim, pending)
+    source, expected = samples("S24_3LE", frames=8)
+    pipe.write(source)
+    audio.read_audio(pipe.read_fd)
+    assert audio.snapshot().read_from(0)[1] == expected
+    assert not audio.pending  # In particular, no two-byte old-format offset.
 
 
-def test_queued_tail_is_drained_when_reader_attaches_after_new_metadata(bridge):
+def test_queued_tail_is_drained_when_reader_attaches_after_new_metadata(bridge, audio_pipe):
     audio = bridge.AudioStream()
-    read_fd, write_fd = os.pipe()
-    try:
-        audio.begin()
-        audio.describe("44100/S16_LE/2")
-        os.write(write_fd, b"old-tail")
-        audio.end()  # No registered reader yet.
-        audio.describe("48000/S24_3LE/2")
-        audio.begin()
-        audio.attach_audio(read_fd)
-        assert audio.read_audio(read_fd)[0] is None
-        source, expected = samples("S24_3LE", frames=8)
-        os.write(write_fd, source)
-        audio.read_audio(read_fd)
-        assert audio.snapshot().read_from(0)[1] == expected
-        assert not audio.pending
-    finally:
-        audio.detach_audio(read_fd)
-        os.close(read_fd)
-        os.close(write_fd)
+    pipe = audio_pipe(audio)
+    audio.begin()
+    audio.describe("44100/S16_LE/2")
+    pipe.write(b"old-tail")
+    audio.end()  # No registered reader yet.
+    audio.describe("48000/S24_3LE/2")
+    audio.begin()
+    audio.attach_audio(pipe.read_fd)
+    assert audio.read_audio(pipe.read_fd)[0] is None
+    source, expected = samples("S24_3LE", frames=8)
+    pipe.write(source)
+    audio.read_audio(pipe.read_fd)
+    assert audio.snapshot().read_from(0)[1] == expected
+    assert not audio.pending
 
 
-def test_completed_old_eof_does_not_drain_new_writers_first_audio(bridge):
+def test_completed_old_eof_does_not_drain_new_writers_first_audio(bridge, audio_pipe):
     audio = bridge.AudioStream()
-    read_fd, write_fd = os.pipe()
-    try:
-        audio.attach_audio(read_fd)
-        audio.begin()
-        audio.describe("44100/S16_LE/2")
-        os.write(write_fd, b"old!")
-        audio.read_audio(read_fd)
-        os.close(write_fd)
-        write_fd = None
-        assert audio.read_audio(read_fd)[0] == b""
-        audio.detach_audio(read_fd)
-    finally:
-        os.close(read_fd)
-        if write_fd is not None:
-            os.close(write_fd)
+    old_pipe = audio_pipe(audio)
+    audio.attach_audio(old_pipe.read_fd)
+    audio.begin()
+    audio.describe("44100/S16_LE/2")
+    old_pipe.write(b"old!")
+    audio.read_audio(old_pipe.read_fd)
+    old_pipe.close_writer()
+    assert audio.read_audio(old_pipe.read_fd)[0] == b""
+    old_pipe.close()
     audio.end()
     audio.describe("48000/S24_3LE/2")
     audio.begin()
-    read_fd, write_fd = os.pipe()
-    try:
-        source, expected = samples("S24_3LE", frames=8)
-        os.write(write_fd, source)  # New data is already queued before reader attachment.
-        audio.attach_audio(read_fd)
-        audio.read_audio(read_fd)
-        assert audio.snapshot().read_from(0)[1] == expected
-    finally:
-        audio.detach_audio(read_fd)
-        os.close(read_fd)
-        os.close(write_fd)
+    new_pipe = audio_pipe(audio)
+    source, expected = samples("S24_3LE", frames=8)
+    new_pipe.write(source)  # New data is queued before reader attachment.
+    audio.attach_audio(new_pipe.read_fd)
+    audio.read_audio(new_pipe.read_fd)
+    assert audio.snapshot().read_from(0)[1] == expected
 
 
-def test_pend_cannot_interleave_between_audio_read_and_feed(bridge, monkeypatch):
+def test_pend_cannot_interleave_between_audio_read_and_feed(bridge, monkeypatch, audio_pipe):
     audio = bridge.AudioStream()
-    read_fd, write_fd = os.pipe()
+    pipe = audio_pipe(audio)
+    read_fd = pipe.read_fd
     entered, release, end_requested, ended = (threading.Event() for _ in range(4))
     failures, paused = [], []
     real_read = os.read
@@ -290,7 +199,7 @@ def test_pend_cannot_interleave_between_audio_read_and_feed(bridge, monkeypatch)
         audio.attach_audio(read_fd)
         audio.begin()
         audio.describe("44100/S16_LE/2")
-        os.write(write_fd, b"old-tail")
+        pipe.write(b"old-tail")
         monkeypatch.setattr(bridge.os, "read", pause_read)
         reader.start()
         assert entered.wait(1)
@@ -304,7 +213,7 @@ def test_pend_cannot_interleave_between_audio_read_and_feed(bridge, monkeypatch)
         audio.describe("48000/S24_3LE/2")
         audio.begin()
         source, expected = samples("S24_3LE", frames=8)
-        os.write(write_fd, source)
+        pipe.write(source)
         audio.read_audio(read_fd)
         assert audio.snapshot().read_from(0)[1] == expected
         assert not audio.pending
@@ -314,30 +223,6 @@ def test_pend_cannot_interleave_between_audio_read_and_feed(bridge, monkeypatch)
             reader.join(2)
         if ender.ident is not None:
             ender.join(2)
-        audio.detach_audio(read_fd)
-        os.close(read_fd)
-        os.close(write_fd)
-
-
-@pytest.mark.integration
-def test_cached_smoke_program_accepts_legacy_bridge_and_checks_samples(monkeypatch, capsys):
-    program_path = Path(__file__).parents[1] / ".github/scripts/docker_smoke.py"
-    program = program_path.read_text()  # Cached before switching release source.
-    legacy_source = '''import subprocess
-def encode():
-    subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
-        "-c:a", "flac", "-compression_level", "0", "-flush_packets", "1",
-        "-f", "flac", "pipe:1"])
-'''
-    legacy_bridge = {}
-    exec(compile(legacy_source, "legacy_server.py", "exec"), legacy_bridge)
-    monkeypatch.setattr(runpy, "run_path", Mock(return_value=legacy_bridge))
-    monkeypatch.setattr(Path, "read_text", Mock(return_value=legacy_source))
-    with pytest.raises(SystemExit) as exit_result:
-        exec(compile(program, str(program_path), "exec"), {"__file__": str(program_path)})
-    assert exit_result.value.code == 0
-    assert "Legacy bridge import and exact PCM/FLAC round trip passed" in capsys.readouterr().out
 
 
 def test_ring_close_wakes_a_blocked_reader(bridge):
@@ -534,35 +419,3 @@ def test_http_rejects_audio_before_format_is_known(bridge, method):
     handler.send_error = Mock()
     getattr(handler, method)()
     assert handler.send_error.call_args.args[0] == 503
-
-
-@pytest.mark.parametrize("format", FORMATS)
-@pytest.mark.parametrize("rate", (44100, 48000))
-@pytest.mark.integration
-def test_every_encoder_preserves_samples(bridge, format, rate):
-    ffmpeg = shutil.which("ffmpeg")
-    assert ffmpeg, "FFmpeg is required for PCM integration tests"
-    pcm = bridge.PCMFormat.from_description(f"{rate}/{format}/2")
-    source, expected = samples(format)
-    audio = bridge.AudioStream()
-    audio.begin()
-    audio.feed(source)
-    audio.describe(f"{rate}/{format}/2")
-    _, canonical = audio.snapshot().read_from(0)
-    command = pcm.encoder_command()
-    command[0] = ffmpeg
-    encoded = subprocess.run(command, input=canonical, capture_output=True,
-                             check=True, timeout=15)
-    decoded = subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-         "-f", pcm.ffmpeg_format, "-c:a", "pcm_" + pcm.ffmpeg_format, "pipe:1"],
-        input=encoded.stdout, capture_output=True, check=True, timeout=15,
-    )
-    assert decoded.stdout == expected
-    # Exercise the actual WAV header and payload together, including BE/padded inputs.
-    wav_decoded = subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-         "-f", pcm.ffmpeg_format, "-c:a", "pcm_" + pcm.ffmpeg_format, "pipe:1"],
-        input=pcm.wav_header() + canonical, capture_output=True, check=True, timeout=15,
-    )
-    assert wav_decoded.stdout == expected
