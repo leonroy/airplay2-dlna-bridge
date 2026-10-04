@@ -1,0 +1,6 @@
+# Use together with docker-compose.yml to test local source.
+services:
+  bridge:
+    image: airplay2-bridge:dev
+    pull_policy: build
+    build: ./bridge
