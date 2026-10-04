@@ -98,6 +98,24 @@ different `odsc` within one session stops playback. The separate metadata pipe
 provides no audio byte offset, and unannounced changes cannot be detected.
 Keep fixed output until automatic transitions pass live playback tests.
 
+To measure live FLAC encoder startup and verify exact sample round trips, run
+`python3 -B tests/flac_startup.py --benchmark --roundtrip --repeats 3`. The helper
+must run inside the bridge image being evaluated; host FFmpeg timings do not
+establish the container's behavior. It compares default input probing with
+experimental `-probesize 32 -analyzeduration 0`
+options. Native ARM64 Alpine 3.24 with FFmpeg 8.1.2 emitted its first audio frame
+in approximately 80–93 ms with either command; probing changes showed no material
+gain, so the production command remains unchanged. Local FFmpeg 7.1 improved
+from approximately 4.3–4.6 seconds to 80–93 ms, which is an older-runtime result.
+These timings start just before the first PCM write and end at the first frame
+sync after FLAC metadata; they do not measure complete decoding or audible
+playback. Queued bridge audio can also change the result. The metadata debounce
+and the renderer's stream restart on display updates remain separate sources of
+latency. The exact deployment image digest recorded in the maintenance handoff
+(`sha256:8d9c2c694d1fa3dc05b45921ac8da646e342ec75b7387302b888c8cbcb2359c2`)
+also contains FFmpeg 8.1.2 and showed the same result in local ARM64 tests.
+The live server was not inspected during these measurements.
+
 ### Diagnosing format metadata
 
 Logs correlate `sdsc` (incoming format), `odsc` (pipe output), session boundaries,
