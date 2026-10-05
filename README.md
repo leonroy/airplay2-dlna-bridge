@@ -277,9 +277,11 @@ endpoint.
 
 ## Browser regression tests
 
-The live-log tests use an isolated browser and synthetic events. They do not
+The browser tests use an isolated browser and synthetic events. They do not
 contact a receiver or speaker. They check scroll preservation, history expiry,
 the new-entry button, duplicate events, the Live pulse, and reduced motion.
+They also cover artwork loading and fades, failed or late artwork, small windows,
+connection recovery, backend restarts, and keyboard controls.
 
 Install the test dependencies and Chromium, then run the browser tests:
 
