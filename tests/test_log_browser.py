@@ -31,12 +31,13 @@ def bridge_page(browser, bridge):
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     assets = Path(__file__).parents[1] / "bridge" / "web"
-    types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
+    types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml",
+             ".ico": "image/vnd.microsoft.icon", ".png": "image/png", ".webmanifest": "application/manifest+json"}
 
     def asset(route):
         path = urlsplit(route.request.url).path
         name = "index.html" if path == "/" else path.removeprefix("/")
-        assert name in {"index.html", "app.css", "app.js", "placeholder.svg", "demo.svg"}
+        assert name in {"index.html", "app.css", "app.js", "placeholder.svg", "demo.svg"} | {path[1:] for path in bridge.WEB_ICON_PATHS}
         route.fulfill(body=(assets / name).read_bytes(), content_type=types[Path(name).suffix])
 
     # No HTTP server, receiver, renderer, or real EventSource is contacted.

@@ -40,6 +40,8 @@ PENDING_MAX = 4 * 1024 * 1024       # bound audio waiting for output-description
 BOOT_TIME = time.monotonic()
 INSTANCE_ID = str(time.time_ns())
 WEB_ROOT = Path(__file__).with_name("web")
+WEB_ICON_PATHS = {f"/favicon-{size}.png" for size in (16, 32, 48, 64, 128, 256)} | {
+    "/favicon.svg", "/favicon.ico", "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/site.webmanifest"}
 
 
 class LogHistory:
@@ -736,7 +738,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_body(json.dumps(status_snapshot()).encode(), "application/json; charset=utf-8")
         elif path == "/api/events":
             self.serve_events()
-        elif path in ("/", "/app.css", "/app.js", "/placeholder.svg", "/demo.svg"):
+        elif path in ("/", "/app.css", "/app.js", "/placeholder.svg", "/demo.svg") or path in WEB_ICON_PATHS:
             self.serve_page(path)
         elif self.path.startswith("/stream.flac"):
             self.serve_flac()
@@ -764,13 +766,15 @@ class StreamHandler(BaseHTTPRequestHandler):
         # Explicit routes: arbitrary paths can never read files from the container.
         name = "index.html" if path == "/" else path[1:]
         types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript",
-                 ".svg": "image/svg+xml"}
+                 ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/vnd.microsoft.icon",
+                 ".webmanifest": "application/manifest+json"}
         try:
             body = (WEB_ROOT / name).read_bytes()
         except OSError:
             self.send_error(404)
             return
-        self.send_body(body, types[Path(name).suffix] + "; charset=utf-8")
+        suffix = Path(name).suffix
+        self.send_body(body, types[suffix] + ("" if suffix in (".png", ".ico") else "; charset=utf-8"))
 
     def send_event(self, name, value):
         payload = json.dumps(value, ensure_ascii=True, separators=(",", ":"))

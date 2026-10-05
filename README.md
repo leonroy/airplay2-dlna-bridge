@@ -87,8 +87,30 @@ a different name in the AirPlay menu, edit `general.name` in
 Open `http://<bridge-host>:<stream-port>/` to see track information, cover art, and live status.
 The default stream port is `8000`. The page uses the existing bridge container.
 
+![Playback page, connection details, and live logs](docs/status-page.gif)
+
+This animation uses fictional track, speaker, and log data.
+It shows playback information, the background fade, connection details, and live logs.
+
+The playback page shows the speaker name, artwork, title, artist, and album.
+It also shows the AirPlay version, source codec, audio format, speaker state, and volume.
+A codec is an audio encoding format. AirPlay version and codec come from session metadata.
+Unknown values stay unknown until the bridge receives that metadata.
+FLAC describes the outgoing speaker stream. It does not restore detail lost in a lossy source such as AAC.
+The artwork sets the background color, which fades between tracks.
+
 The hamburger menu opens connection details and bridge application logs.
 The page is read-only. It does not send playback or volume commands.
+Connection details show session information, audio counters, command results, and the age of speaker observations.
+The log panel fills the available window and retains padding around its edges.
+Escape closes a popup and returns keyboard focus to the menu button.
+
+Live logs follow new entries while you stay at the bottom.
+If you scroll up, new entries continue without moving your reading position.
+Select the floating new-entry button to return to the bottom and resume following.
+The Live label pulses gently in red while you follow the latest entry.
+Reduced-motion mode uses a steady red label and disables the background fade.
+The page includes browser favicons, an Apple touch icon, and icons for phone shortcuts.
 
 One Server-Sent Events connection sends status snapshots every two seconds.
 Server-Sent Events let the server send updates over an open browser connection.

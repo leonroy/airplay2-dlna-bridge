@@ -2,6 +2,7 @@
 import http.client
 import json
 import socket
+import struct
 import threading
 import time
 from unittest.mock import Mock
@@ -120,7 +121,8 @@ def test_log_still_prints_and_reaches_history(bridge, capsys):
 
 
 @pytest.mark.parametrize('path,content_type', [('/', 'text/html'), ('/app.css', 'text/css'),
-    ('/app.js', 'text/javascript'), ('/demo.svg', 'image/svg+xml'), ('/placeholder.svg', 'image/svg+xml')])
+    ('/app.js', 'text/javascript'), ('/demo.svg', 'image/svg+xml'), ('/placeholder.svg', 'image/svg+xml'),
+    ('/favicon.svg', 'image/svg+xml')])
 def test_page_assets_are_served_without_audio_clients(http_server, bridge, path, content_type):
     connection, response = http_server(path)
     assert response.status == 200
@@ -135,6 +137,43 @@ def test_unlisted_paths_do_not_serve_files(http_server, path):
     connection, response = http_server(path)
     assert response.status == 404
     response.read()
+    connection.close()
+
+
+def test_browser_and_phone_icons_have_valid_formats(http_server):
+    for path, size in [('/favicon-16.png', 16), ('/favicon-32.png', 32),
+                       ('/favicon-48.png', 48), ('/favicon-64.png', 64),
+                       ('/favicon-128.png', 128), ('/favicon-256.png', 256),
+                       ('/apple-touch-icon.png', 180), ('/icon-192.png', 192), ('/icon-512.png', 512)]:
+        connection, response = http_server(path)
+        assert response.status == 200
+        assert response.getheader('Content-Type') == 'image/png'
+        body = response.read()
+        assert body.startswith(b'\x89PNG\r\n\x1a\n')
+        assert struct.unpack('>II', body[16:24]) == (size, size)
+        connection.close()
+    connection, response = http_server('/favicon.ico')
+    assert response.getheader('Content-Type') == 'image/vnd.microsoft.icon'
+    body = response.read()
+    reserved, kind, count = struct.unpack('<HHH', body[:6])
+    assert (reserved, kind, count) == (0, 1, 6)
+    for index in range(count):
+        width, height, _, _, planes, bits, length, offset = struct.unpack('<BBBBHHII', body[6 + index * 16:22 + index * 16])
+        png = body[offset:offset + length]
+        assert len(png) == length and png.startswith(b'\x89PNG\r\n\x1a\n')
+        assert struct.unpack('>II', png[16:24]) == (width or 256, height or 256)
+        assert (planes, bits) == (1, 32)
+    connection.close()
+
+
+def test_manifest_references_phone_icons(http_server):
+    connection, response = http_server('/site.webmanifest')
+    assert response.status == 200
+    assert response.getheader('Content-Type').startswith('application/manifest+json')
+    manifest = json.loads(response.read())
+    assert manifest['start_url'] == '/'
+    assert [(icon['src'], icon['sizes']) for icon in manifest['icons']] == [
+        ('/icon-192.png', '192x192'), ('/icon-512.png', '512x512')]
     connection.close()
 
 
