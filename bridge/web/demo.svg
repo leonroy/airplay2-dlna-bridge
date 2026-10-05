@@ -1,1 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#9c6762"/><stop offset=".55" stop-color="#dab193"/><stop offset="1" stop-color="#6f7188"/></linearGradient></defs><rect width="600" height="600" fill="url(#sky)"/><circle cx="405" cy="260" r="63" fill="#efceb0"/><path d="M0 380 120 307 285 417 400 360 600 435V600H0" fill="#645e72"/><path d="M0 455 180 413 365 467 600 422V600H0" fill="#444355"/><path d="M250 600C265 553 337 529 319 494S277 458 295 436L304 436C289 458 338 466 342 494S293 557 356 600Z" fill="#aba39b" opacity=".65"/><text x="44" y="73" font-family="sans-serif" font-size="16" letter-spacing="5" fill="#fff" opacity=".8">EXAMPLE ARTIST</text><text x="42" y="123" font-family="sans-serif" font-size="40" letter-spacing="-1" fill="#fff">Evening Drive</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1"><stop stop-color="#9c6762"/><stop offset=".55" stop-color="#dab193"/><stop offset="1" stop-color="#6f7188"/></linearGradient>
+    <linearGradient id="mist" x2="0" y2="1"><stop stop-color="#e8c6b1" stop-opacity="0"/><stop offset=".65" stop-color="#e8c6b1" stop-opacity=".26"/><stop offset="1" stop-color="#e8c6b1" stop-opacity="0"/></linearGradient>
+    <path id="pine" d="M0 0-13 31-6 29-22 52-12 49-31 77-17 73-39 102-3 99-3 123H3V99L39 102 17 73 31 77 12 49 22 52 6 29 13 31Z"/>
+  </defs>
+  <rect width="600" height="600" fill="url(#sky)"/>
+  <circle cx="405" cy="260" r="63" fill="#efceb0" opacity=".8"/>
+  <path d="M0 350 92 287 164 307 244 278 330 322 422 284 600 358V600H0" fill="#777080"/>
+  <path d="M0 380 120 307 285 417 400 360 600 435V600H0" fill="#645e72"/>
+  <g fill="#4a4d50" opacity=".65"><use href="#pine" transform="translate(28 325) scale(.95)"/><use href="#pine" transform="translate(83 345) scale(.8)"/><use href="#pine" transform="translate(135 368) scale(.65)"/><use href="#pine" transform="translate(187 395) scale(.45)"/></g>
+  <rect y="270" width="600" height="220" fill="url(#mist)"/>
+  <path d="M0 455 180 413 365 467 600 422V600H0" fill="#444355"/>
+  <path d="M0 600C100 561 260 549 308 515C343 491 308 472 252 454L267 449C345 461 395 485 360 523C327 557 287 578 273 600Z" fill="#aba39b" opacity=".65"/>
+  <g fill="#34343e"><use href="#pine" transform="translate(538 258) scale(2.8)"/><use href="#pine" transform="translate(478 335) scale(1.85)"/></g>
+  <text x="44" y="73" font-family="sans-serif" font-size="16" letter-spacing="5" fill="#fff" opacity=".8">EXAMPLE ARTIST</text>
+  <text x="42" y="123" font-family="sans-serif" font-size="40" letter-spacing="-1" fill="#fff">Evening Drive</text>
+</svg>
