@@ -1,6 +1,6 @@
 {
   "name": "AirPlay Bridge",
-  "short_name": "AirPlay",
+  "short_name": "Bridge",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#161616",

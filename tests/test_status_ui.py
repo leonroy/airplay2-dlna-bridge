@@ -132,7 +132,8 @@ def test_page_assets_are_served_without_audio_clients(http_server, bridge, path,
     assert not bridge.CLIENTS
 
 
-@pytest.mark.parametrize('path', ['/../server.py', '/server.py', '/web/../../server.py', '/.env'])
+@pytest.mark.parametrize('path', ['/../server.py', '/server.py', '/web/../../server.py', '/.env',
+    '/favicon-16.png/../../server.py', '/%2e%2e/server.py', '/icon-999.png', '/favicon-16.png', '/icon-1024.png'])
 def test_unlisted_paths_do_not_serve_files(http_server, path):
     connection, response = http_server(path)
     assert response.status == 404
@@ -141,10 +142,7 @@ def test_unlisted_paths_do_not_serve_files(http_server, path):
 
 
 def test_browser_and_phone_icons_have_valid_formats(http_server):
-    for path, size in [('/favicon-16.png', 16), ('/favicon-32.png', 32),
-                       ('/favicon-48.png', 48), ('/favicon-64.png', 64),
-                       ('/favicon-128.png', 128), ('/favicon-256.png', 256),
-                       ('/apple-touch-icon.png', 180), ('/icon-192.png', 192), ('/icon-512.png', 512)]:
+    for path, size in [('/apple-touch-icon.png', 180), ('/icon-192.png', 192), ('/icon-512.png', 512)]:
         connection, response = http_server(path)
         assert response.status == 200
         assert response.getheader('Content-Type') == 'image/png'
@@ -159,9 +157,16 @@ def test_browser_and_phone_icons_have_valid_formats(http_server):
     assert (reserved, kind, count) == (0, 1, 6)
     for index in range(count):
         width, height, _, _, planes, bits, length, offset = struct.unpack('<BBBBHHII', body[6 + index * 16:22 + index * 16])
-        png = body[offset:offset + length]
-        assert len(png) == length and png.startswith(b'\x89PNG\r\n\x1a\n')
-        assert struct.unpack('>II', png[16:24]) == (width or 256, height or 256)
+        image = body[offset:offset + length]
+        assert len(image) == length
+        if image.startswith(b'\x89PNG\r\n\x1a\n'):
+            assert struct.unpack('>II', image[16:24]) == (width or 256, height or 256)
+        else:
+            # ICO can contain a Windows bitmap with both pixels and a mask.
+            header, bitmap_width, bitmap_height, bitmap_planes, bitmap_bits = struct.unpack('<IiiHH', image[:16])
+            assert header >= 40
+            assert (bitmap_width, bitmap_height) == (width or 256, (height or 256) * 2)
+            assert (bitmap_planes, bitmap_bits) == (1, 32)
         assert (planes, bits) == (1, 32)
     connection.close()
 
