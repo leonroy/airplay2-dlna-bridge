@@ -82,6 +82,38 @@ a different name in the AirPlay menu, edit `general.name` in
 
 ## Configuration
 
+### Playback status page
+
+Open `http://<bridge-host>:<stream-port>/` to see track information, cover art, and live status.
+The default stream port is `8000`. The page uses the existing bridge container.
+
+The hamburger menu opens connection details and bridge application logs.
+The page is read-only. It does not send playback or volume commands.
+
+One Server-Sent Events connection sends status snapshots every two seconds.
+Server-Sent Events let the server send updates over an open browser connection.
+The same connection sends log lines when the log panel is open.
+The browser closes the connection when the page is hidden.
+
+A separate worker reads recipient playback state and hardware volume while viewers are connected.
+It checks every five seconds after the previous check completes.
+All viewers share the results. Each check has a two-second total deadline.
+Unsupported fields show as unavailable. Observations older than 15 seconds show as stale.
+Endpoint status describes received audio; it does not confirm that AirPlay discovery works.
+The recipient description URL is `http://<recipient-address>:49152/description.xml` by default.
+For another description port, set `RENDERER_PORT` in the bridge container environment.
+
+Log history stays in memory, with limits of 500 entries and 512 KiB.
+Individual messages are limited to 4 KiB. Up to eight live status viewers can connect.
+Slow log viewers skip expired messages. History resets when the bridge process restarts.
+The page shows bridge application messages, not complete Docker output or Shairport Sync logs.
+
+For fictional sample data, open `/?demo=playing`, `/?demo=idle`, `/?demo=waiting`, or `/?demo=failure`.
+Demo pages do not connect to the live event stream or trigger recipient checks.
+The page uses local assets and does not need another container or frontend dependencies.
+
+### Environment configuration
+
 Everything is in `.env` (see `.env.example` for details): `DIDL_PUSH` toggles
 display updates, `MAX_VOLUME` caps the hardware volume, `STREAM_PORT` moves the
 stream port. The AirPlay name is set in `shairport-sync.conf` (`general.name`).
@@ -242,6 +274,25 @@ Multiroom among LinkPlay devices works fine the other way around: group your
 other WiiM/LinkPlay speakers behind the renderer in the WiiM Home app (firmware
 handles tight sync between them), and AirPlay to the bridge as a single
 endpoint.
+
+## Browser regression tests
+
+The live-log tests use an isolated browser and synthetic events. They do not
+contact a receiver or speaker. They check scroll preservation, history expiry,
+the new-entry button, duplicate events, the Live pulse, and reduced motion.
+
+Install the test dependencies and Chromium, then run the browser tests:
+
+```sh
+python -m pip install -r requirements-dev.txt -r requirements-browser.txt
+python -m playwright install chromium
+python -m pytest tests/test_log_browser.py -q
+```
+
+To use an existing Chromium-based browser instead, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE` to its executable path. The main test suite
+skips browser tests when Playwright is absent. The dedicated browser CI job
+installs Playwright and Chromium and runs these tests.
 
 ## Credits
 

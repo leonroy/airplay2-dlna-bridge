@@ -9,7 +9,8 @@
 - the shairport metadata pipe drives UPnP Play/Stop, hardware volume, and
   now-playing DIDL pushes on the renderer
 """
-import base64, collections, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
+import base64, collections, json, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 from xml.etree import ElementTree
@@ -19,6 +20,9 @@ META_PIPE = "/shared/metadata"
 PORT = int(os.environ.get("STREAM_PORT", "8000"))
 STREAM_URL = os.environ.get("STREAM_URL", "")
 RENDERER_IP = os.environ.get("RENDERER_IP") or os.environ.get("WIIM_IP", "")
+RENDERER_PORT = int(os.environ.get("RENDERER_PORT", "49152"))
+if not 1 <= RENDERER_PORT <= 65535:
+    raise ValueError("RENDERER_PORT must be between 1 and 65535")
 MAX_VOLUME = int(os.environ.get("MAX_VOLUME", "100"))
 HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", "16"))
 FLAC_MAX_ENCODERS = int(os.environ.get("FLAC_MAX_ENCODERS", "4"))
@@ -33,6 +37,45 @@ ICY_META_INT = 131072               # same interval airupnp uses
 RING_SECONDS = 12
 BACKLOG_SECONDS = 1.5
 PENDING_MAX = 4 * 1024 * 1024       # bound audio waiting for output-description metadata
+BOOT_TIME = time.monotonic()
+INSTANCE_ID = str(time.time_ns())
+WEB_ROOT = Path(__file__).with_name("web")
+
+
+class LogHistory:
+    """One bounded history shared by all viewers; no network work under its lock."""
+    def __init__(self, max_entries=500, max_bytes=512 * 1024):
+        self.lock = threading.Lock()
+        self.entries = collections.deque()
+        self.max_entries, self.max_bytes = max_entries, max_bytes
+        self.bytes = self.sequence = 0
+
+    def append(self, line):
+        raw = line.encode("utf-8", errors="replace")[:4096]
+        line = raw.decode("utf-8", errors="ignore")
+        with self.lock:
+            self.sequence += 1
+            self.entries.append((self.sequence, line, len(raw)))
+            self.bytes += len(raw)
+            while self.entries and (len(self.entries) > self.max_entries or self.bytes > self.max_bytes):
+                self.bytes -= self.entries.popleft()[2]
+
+    def read(self, cursor):
+        with self.lock:
+            gap = bool(self.entries and cursor is not None and cursor < self.entries[0][0] - 1)
+            # At most ~64 KiB per batch; a slow viewer cannot create a private queue.
+            records = [(seq, line) for seq, line, _ in self.entries
+                       if cursor is None or seq > cursor][:16]
+            return records, gap
+
+
+LOG_HISTORY = LogHistory()
+VIEWERS = threading.Condition()
+VIEWER_COUNT = 0
+MAX_VIEWERS = 8
+OBSERVER = None
+COMMAND_LOCK = threading.Lock()
+LAST_COMMAND = None
 
 
 class PCMFormat(collections.namedtuple("PCMFormatBase", "rate format channels")):
@@ -131,7 +174,9 @@ class StreamEnded(Exception):
 def log(msg):
     now = time.time()
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
-    print(f"[bridge] {stamp}.{int(now % 1 * 1000):03d}Z {msg}", flush=True)
+    line = f"[bridge] {stamp}.{int(now % 1 * 1000):03d}Z {msg}"
+    print(line, flush=True)
+    LOG_HISTORY.append(line)
 
 
 def description_for_log(data):
@@ -210,6 +255,7 @@ class AudioStream:
         self.lock = threading.RLock()
         self.ring = None
         self.pcm = None
+        self.source_codec = self.stream_type = None
         self.pending = bytearray()
         self.active = False
         self.failed = False
@@ -313,6 +359,7 @@ class AudioStream:
             if self.ring is not None:
                 self.ring.close()
             self.ring = self.pcm = None
+            self.source_codec = self.stream_type = None
             self.pending.clear()
             self.active = self.failed = False
             self.session_id = self.started = self.first_audio = self.wait_logged = None
@@ -658,6 +705,10 @@ class StreamHandler(BaseHTTPRequestHandler):
         return parsed
 
     def log_message(self, fmt, *args):
+        # Refreshes and SSE reconnects must not flood the live log history.
+        path = urllib.parse.urlsplit(self.path).path
+        if path in ("/api/status", "/api/events") and len(args) > 1 and str(args[1]) == "200":
+            return
         log(f"http {self.address_string()} {fmt % args}")
 
     def write_stream(self, client, data):
@@ -678,7 +729,14 @@ class StreamHandler(BaseHTTPRequestHandler):
             deadline = time.monotonic() + STREAM_WRITE_TIMEOUT
 
     def do_GET(self):
-        if self.path.startswith("/stream.flac"):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/status":
+            self.send_body(json.dumps(status_snapshot()).encode(), "application/json; charset=utf-8")
+        elif path == "/api/events":
+            self.serve_events()
+        elif path in ("/", "/app.css", "/app.js", "/placeholder.svg", "/demo.svg"):
+            self.serve_page(path)
+        elif self.path.startswith("/stream.flac"):
             self.serve_flac()
         elif self.path.startswith("/stream.wav"):
             self.serve_wav()
@@ -686,6 +744,78 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.serve_art()
         else:
             self.send_error(404)
+
+    def send_body(self, body, content_type):
+        self.connection.settimeout(5)
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (OSError, socket.timeout):
+            pass
+
+    def serve_page(self, path):
+        # Explicit routes: arbitrary paths can never read files from the container.
+        name = "index.html" if path == "/" else path[1:]
+        types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript",
+                 ".svg": "image/svg+xml"}
+        try:
+            body = (WEB_ROOT / name).read_bytes()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_body(body, types[Path(name).suffix] + "; charset=utf-8")
+
+    def send_event(self, name, value):
+        payload = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+        self.wfile.write(f"event: {name}\ndata: {payload}\n\n".encode())
+        self.wfile.flush()
+
+    def serve_events(self):
+        global VIEWER_COUNT
+        logs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("logs") == ["1"]
+        with VIEWERS:
+            if VIEWER_COUNT >= MAX_VIEWERS:
+                self.send_error(503, "Too many status viewers")
+                return
+            VIEWER_COUNT += 1
+            VIEWERS.notify_all()
+        try:
+            self.connection.settimeout(5)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")
+            cursor = None
+            next_status = 0.0
+            while True:
+                now = time.monotonic()
+                if now >= next_status:
+                    self.send_event("status", status_snapshot())
+                    next_status = now + 2
+                if logs:
+                    entries, gap = LOG_HISTORY.read(cursor)
+                    if gap:
+                        self.send_event("gap", {"message": "Some older log lines expired."})
+                    for seq, line in entries:
+                        self.send_event("log", {"sequence": seq, "line": line})
+                        cursor = seq
+                # Observe FIN as well as RST, including while no log lines arrive.
+                readable, _, _ = select.select([self.connection], [], [], 0.25)
+                if readable:
+                    break
+        except (OSError, socket.timeout, ValueError):
+            pass
+        finally:
+            with VIEWERS:
+                VIEWER_COUNT -= 1
+                VIEWERS.notify_all()
 
     def serve_art(self):
         m = re.search(r"/art-(\d+)", self.path)
@@ -920,7 +1050,7 @@ SOAP_BODY_MAX = 64 * 1024
 
 
 def http_req(url, data=None, headers=None, timeout=HTTP_TIMEOUT, *, deadline=None,
-             max_bytes=HTTP_BODY_MAX):
+             max_bytes=HTTP_BODY_MAX, allowed_statuses=()):
     """Bound the entire numeric-IP HTTP exchange, including trickling responses.
 
     The watchdog shuts down the actual socket: no orphan request can keep the
@@ -966,7 +1096,7 @@ def http_req(url, data=None, headers=None, timeout=HTTP_TIMEOUT, *, deadline=Non
             raise TimeoutError("renderer command deadline exceeded")
         if len(body) > max_bytes:
             raise ValueError("renderer response exceeds size limit")
-        if not 200 <= response.status < 300:
+        if not 200 <= response.status < 300 and response.status not in allowed_statuses:
             raise OSError(f"renderer HTTP status {response.status}")
         return body
     finally:
@@ -1001,13 +1131,13 @@ class Renderer:
             return None
         if service not in self.controls:
             host = f"[{self.ip}]" if ":" in self.ip else self.ip
-            desc = http_req(f"http://{host}:49152/description.xml",
+            desc = http_req(f"http://{host}:{RENDERER_PORT}/description.xml",
                             deadline=deadline).decode(errors="replace")
             m = re.search(rf"<service>(?:(?!</service>).)*?{service}(?:(?!</service>).)*?"
                           r"<controlURL>([^<]+)</controlURL>", desc, re.S)
             if m:
                 path = m.group(1)
-                self.controls[service] = (f"http://{host}:49152"
+                self.controls[service] = (f"http://{host}:{RENDERER_PORT}"
                                           f"{path if path.startswith('/') else '/' + path}")
             else:
                 raise ValueError(f"renderer has no {service} control URL")
@@ -1015,6 +1145,8 @@ class Renderer:
 
     def action(self, name, args, service="AVTransport"):
         """Worker-only I/O. Return failure explicitly, including SOAP faults."""
+        global LAST_COMMAND
+        success = False
         deadline = time.monotonic() + HTTP_TIMEOUT
         try:
             control = self.resolve(service, deadline)
@@ -1035,10 +1167,14 @@ class Renderer:
             expected = f"{{{srv}}}{name}Response"
             if not any(element.tag == expected for element in document.iter()):
                 raise ValueError(f"renderer omitted {name}Response")
+            success = True
             return True
         except Exception as error:
             log(f"renderer {name} failed: {error}")
             return False
+        finally:
+            with COMMAND_LOCK:
+                LAST_COMMAND = {"name": name, "accepted": success, "at": time.time()}
 
     @staticmethod
     def uri_args(snapshot):
@@ -1219,6 +1355,161 @@ class Renderer:
             time.sleep(0.05)
 
 
+class UnsupportedObservation(Exception):
+    pass
+
+
+class RecipientObserver:
+    """Read-only device I/O, isolated from the playback dispatcher and its cache."""
+    def __init__(self, ip):
+        self.ip = ip
+        self.controls = {}
+        self.lock = threading.Lock()
+        self.name = None
+        self.fields = {name: {"value": None, "at": None, "error": None}
+                       for name in ("playback", "volume")}
+        self.stopping = threading.Event()
+
+    def read(self, name, args, service, field, deadline):
+        host = f"[{self.ip}]" if ":" in self.ip else self.ip
+        if service not in self.controls:
+            desc = http_req(f"http://{host}:{RENDERER_PORT}/description.xml", deadline=deadline)
+            root = ElementTree.fromstring(desc)
+            device = next((item for item in root if item.tag.rsplit("}", 1)[-1] == "device"), None)
+            if device is not None:
+                speaker_name = next((item.text for item in device
+                             if item.tag.rsplit("}", 1)[-1] == "friendlyName"), None)
+                with self.lock:
+                    self.name = speaker_name.strip()[:256] if speaker_name and speaker_name.strip() else None
+            for item in root.iter():
+                if item.tag.rsplit("}", 1)[-1] != "service":
+                    continue
+                values = {child.tag.rsplit("}", 1)[-1]: child.text for child in item}
+                if values.get("serviceType") == f"urn:schemas-upnp-org:service:{service}:1":
+                    path = values.get("controlURL")
+                    if path:
+                        control = urllib.parse.urljoin(f"http://{host}:{RENDERER_PORT}/", path)
+                        parts = urllib.parse.urlsplit(control)
+                        if (parts.scheme != "http" or parts.username or parts.password
+                                or parts.hostname != self.ip or parts.port != RENDERER_PORT):
+                            raise ValueError("Recipient control URL changed the target")
+                        self.controls[service] = control
+                        break
+            if service not in self.controls:
+                raise UnsupportedObservation("Service unavailable")
+        srv = f"urn:schemas-upnp-org:service:{service}:1"
+        body = (f'<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                f'<s:Body><u:{name} xmlns:u="{srv}"><InstanceID>0</InstanceID>{args}'
+                f'</u:{name}></s:Body></s:Envelope>')
+        raw = http_req(self.controls[service], data=body.encode(), headers={
+            "Content-Type": 'text/xml; charset="utf-8"', "SOAPACTION": f'"{srv}#{name}"'
+        }, deadline=deadline, max_bytes=SOAP_BODY_MAX, allowed_statuses=(500,))
+        root = ElementTree.fromstring(raw)
+        elements = list(root.iter())
+        fault = next((item for item in elements if item.tag.rsplit("}", 1)[-1] == "Fault"), None)
+        if fault is not None:
+            codes = [item.text for item in fault.iter() if item.tag.rsplit("}", 1)[-1] == "errorCode"]
+            if "401" in codes:
+                raise UnsupportedObservation("Action unavailable")
+            raise ValueError("Recipient query failed")
+        response = next((item for item in elements if item.tag == f"{{{srv}}}{name}Response"), None)
+        if response is None:
+            raise ValueError("Invalid recipient response")
+        value = next((item.text for item in response.iter()
+                      if item.tag.rsplit("}", 1)[-1] == field), None)
+        if value is None:
+            raise ValueError("Missing recipient state")
+        if name == "GetVolume":
+            volume = int(value)
+            if not 0 <= volume <= 100:
+                raise ValueError("Invalid volume")
+            return volume
+        allowed = {"PLAYING", "PAUSED_PLAYBACK", "STOPPED", "TRANSITIONING", "NO_MEDIA_PRESENT"}
+        if value not in allowed:
+            raise UnsupportedObservation("Playback state unavailable")
+        return value
+
+    def observe_once(self):
+        if not self.ip:
+            return
+        deadline = time.monotonic() + 2
+        for key, name, args, service, field in (
+            ("playback", "GetTransportInfo", "", "AVTransport", "CurrentTransportState"),
+            ("volume", "GetVolume", "<Channel>Master</Channel>", "RenderingControl", "CurrentVolume")
+        ):
+            try:
+                value = self.read(name, args, service, field, deadline)
+            except UnsupportedObservation:
+                with self.lock:
+                    self.fields[key] = {"value": None, "at": time.time(), "error": "unavailable"}
+            except Exception:
+                with self.lock:
+                    self.fields[key]["error"] = "connection"
+                # Re-discover endpoints next time after failures or device restarts.
+                self.controls.pop(service, None)
+            else:
+                with self.lock:
+                    self.fields[key] = {"value": value, "at": time.time(), "error": None}
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            result = {name: dict(item, stale=item["at"] is not None and now - item["at"] > 15)
+                      for name, item in self.fields.items()}
+            result["name"] = self.name
+        result["configured"] = bool(self.ip)
+        return result
+
+    def run(self):
+        next_check = 0.0
+        while not self.stopping.is_set():
+            with VIEWERS:
+                if not VIEWER_COUNT:
+                    VIEWERS.wait(1)
+                    next_check = 0.0
+                    continue
+            now = time.monotonic()
+            if now >= next_check:
+                self.observe_once()
+                next_check = time.monotonic() + 5
+            self.stopping.wait(0.25)
+
+
+def status_snapshot():
+    """Only small in-memory reads; never access the recipient or start an encoder."""
+    now = time.monotonic()
+    with AUDIO.lock:
+        state = ("error" if AUDIO.failed else
+                 "waiting" if AUDIO.session_id is not None and AUDIO.pcm is None else
+                 "receiving" if AUDIO.active and AUDIO.first_audio is not None else "idle")
+        pcm = ({"rate": AUDIO.pcm.rate, "bits": AUDIO.pcm.bits, "channels": AUDIO.pcm.channels}
+               if AUDIO.pcm else None)
+        audio = {"state": state, "session": AUDIO.session_id,
+                 "codec": AUDIO.source_codec, "stream_type": AUDIO.stream_type,
+                 "airplay_version": {"Classic": 1, "Realtime": 2, "Buffered": 2}.get(AUDIO.stream_type),
+                 "age_seconds": round(now - AUDIO.started, 1) if AUDIO.started is not None else None,
+                 "format": pcm, "pending_bytes": len(AUDIO.pending), "buffered_bytes": 0,
+                 "raw_bytes": AUDIO.raw_bytes, "discarded_bytes": AUDIO.discarded_bytes}
+        if AUDIO.ring is not None:
+            with AUDIO.ring.cond:
+                audio["buffered_bytes"] = len(AUDIO.ring.buf)
+        track = {key: NOW_PLAYING[key][:4096] for key in ("title", "artist", "album")}
+        track["artwork"] = f'/art-{ART["id"]}.jpg' if ART["bytes"] and AUDIO.active else None
+        if not AUDIO.active:
+            track.update(title="", artist="", album="", artwork=None)
+    with CLIENTS_LOCK:
+        connections = sum(not item.cancelled.is_set() and not item.ring.closed for item in CLIENTS)
+    with COMMAND_LOCK:
+        command = dict(LAST_COMMAND) if LAST_COMMAND else None
+    recipient = OBSERVER.snapshot() if OBSERVER else {
+        "configured": bool(RENDERER_IP),
+        "playback": {"value": None, "at": None, "error": None, "stale": False},
+        "volume": {"value": None, "at": None, "error": None, "stale": False}}
+    return {"instance": INSTANCE_ID, "at": time.time(), "uptime_seconds": int(now - BOOT_TIME), "audio": audio,
+            "track": track, "connections": connections, "command": command, "recipient": recipient}
+
+
 # ---------------------------------------------------------- shairport metadata
 def _walk_dicts(obj):
     if isinstance(obj, dict):
@@ -1302,7 +1593,20 @@ def handle_output_description(data, wiim):
 
 def handle_playback_metadata(code, data, wiim, pending):
     """Handle the real metadata events as well as direct unit-test sequences."""
-    if code == "odsc":
+    if code in ("sdsc", "styp"):
+        try:
+            value = data.decode("ascii")
+        except UnicodeError:
+            return True
+        with AUDIO.lock:
+            if code == "styp" and value in ("Classic", "Realtime", "Buffered"):
+                AUDIO._ensure_session()
+                AUDIO.stream_type = value
+            elif code == "sdsc" and re.fullmatch(r"(ALAC|AAC|PCM)/[0-9]{4,6}/[A-Z0-9_]+/[1-8]", value):
+                AUDIO._ensure_session()
+                AUDIO.source_codec = value.split("/", 1)[0]
+        return True
+    elif code == "odsc":
         handle_output_description(data, wiim)
     elif code == "pbeg":
         with AUDIO.lock:
@@ -1425,6 +1729,7 @@ def metadata_reader(wiim):
 
 
 def main():
+    global OBSERVER
     log(f"PCM requires Shairport 5+ ssnc/odsc metadata; formats={','.join(PCMFormat.FORMATS)} "
         f"channels=1,2 pending_limit={PENDING_MAX} ring_seconds={RING_SECONDS} "
         f"backlog_seconds={BACKLOG_SECONDS}; session IDs are local to this bridge process")
@@ -1433,6 +1738,8 @@ def main():
         if not os.path.exists(p):
             os.mkfifo(p, 0o666)
     wiim = Renderer(RENDERER_IP)
+    OBSERVER = RecipientObserver(RENDERER_IP)
+    threading.Thread(target=OBSERVER.run, daemon=True).start()
     threading.Thread(target=audio_reader, args=(wiim,), daemon=True).start()
     threading.Thread(target=metadata_reader, args=(wiim,), daemon=True).start()
     log(f"serving FLAC+ICY on :{PORT}/stream.flac (diagnostic WAV on /stream.wav)")
