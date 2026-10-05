@@ -222,9 +222,12 @@ def test_late_artwork_cannot_replace_a_newer_track(bridge_page, bridge):
 
 
 @pytest.mark.parametrize("width,height", [(868, 695), (390, 640), (868, 500)])
-def test_small_windows_fit_track_metadata_and_popups(bridge_page, bridge, width, height):
+@pytest.mark.parametrize("font", [None, "Arial, sans-serif"])
+def test_small_windows_fit_track_metadata_and_popups(bridge_page, bridge, width, height, font):
     page = bridge_page
     page.set_viewport_size({"width": width, "height": height})
+    if font:
+        page.add_style_tag(content=f":root {{ font-family: {font}; }}")
     page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/demo.svg"))
     expect(page.locator("#codec")).to_have_text("AirPlay 2 · AAC → FLAC")
     page.wait_for_function("document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth", timeout=5000)
