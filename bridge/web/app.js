@@ -5,6 +5,7 @@
   const demoParam = new URLSearchParams(location.search).get("demo");
   const demo = demoParam !== null;
   let source = null, snapshot = null, lastStatus = 0, panelView = null;
+  let retryTimer = null, retryDelay = 1000;
   let lastSequence = 0, instance = null, lines = [], logBytes = 0;
   let logRenderPending = false;
   let following = true, unreadLogs = 0, pendingLogCount = 0;
@@ -158,12 +159,21 @@
     }
   }
 
-  function connect() {
+  function retryClosedSource() {
+    if (demo || document.hidden || !source || source.readyState !== EventSource.CLOSED || retryTimer !== null) return;
+    retryTimer = setTimeout(() => { retryTimer = null; connect(false); }, retryDelay);
+    retryDelay = Math.min(retryDelay * 2, 30000);
+  }
+
+  function connect(resetBackoff = true) {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (resetBackoff) retryDelay = 1000;
     if (source) { source.close(); source = null; }
     if (demo || document.hidden) return;
     const logs = panelView === "logs";
     source = new EventSource(`/api/events${logs ? "?logs=1" : ""}`);
     const current = source;
+    let gapAnnounced = false;
     current.addEventListener("status", (event) => {
       if (source !== current) return;
       try { render(JSON.parse(event.data)); } catch { disconnected(); }
@@ -172,11 +182,20 @@
       if (!logs || source !== current) return;
       try {
         const entry = JSON.parse(event.data);
-        if (entry.sequence > lastSequence) { lastSequence = entry.sequence; addLog(entry.line, true); }
+        if (entry.sequence > lastSequence) {
+          if (lastSequence && entry.sequence > lastSequence + 1 && !gapAnnounced) addLog("[viewer] Some older log lines expired.");
+          gapAnnounced = false;
+          lastSequence = entry.sequence; addLog(entry.line, true);
+        }
       } catch { addLog("[viewer] Could not read a log message."); }
     });
-    current.addEventListener("gap", () => addLog("[viewer] Some older log lines expired."));
-    current.addEventListener("open", () => { if (source === current) updateLogState("Live"); });
+    current.addEventListener("gap", () => {
+      if (source !== current) return;
+      gapAnnounced = true; addLog("[viewer] Some older log lines expired.");
+    });
+    current.addEventListener("open", () => {
+      if (source === current) { retryDelay = 1000; updateLogState("Live"); }
+    });
     current.addEventListener("error", () => { if (source === current) disconnected(); });
   }
 
@@ -185,6 +204,7 @@
     $("status").dataset.state = "error";
     $("volume").textContent = "";
     updateLogState("Reconnecting…");
+    retryClosedSource();
     $("issue").hidden = false; $("issue").textContent = "Connection lost. Displayed track information can be out of date.";
   }
 
@@ -236,7 +256,7 @@
     $("artwork").alt = "No cover art";
   });
   document.addEventListener("visibilitychange", () => { stopLogPulse(); connect(); });
-  window.addEventListener("pagehide", () => { if (source) source.close(); });
+  window.addEventListener("pagehide", () => { clearTimeout(retryTimer); retryTimer = null; if (source) source.close(); });
   window.addEventListener("pageshow", (event) => { if (event.persisted) connect(); });
   setInterval(() => { if (!demo && !document.hidden && lastStatus && Date.now() - lastStatus > 8000) disconnected(); }, 2000);
 

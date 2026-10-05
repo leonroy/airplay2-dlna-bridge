@@ -625,6 +625,8 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         if max_connections <= 0:
             raise ValueError("max_connections must be positive")
         self.connection_slots = threading.BoundedSemaphore(max_connections)
+        # Long-lived status streams must leave at least one slot for audio.
+        self.status_viewer_limit = min(MAX_VIEWERS, max_connections - 1)
         super().__init__(address, handler)
 
     def process_request(self, request, client_address):
@@ -779,7 +781,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         global VIEWER_COUNT
         logs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("logs") == ["1"]
         with VIEWERS:
-            if VIEWER_COUNT >= MAX_VIEWERS:
+            if VIEWER_COUNT >= getattr(self.server, "status_viewer_limit", MAX_VIEWERS):
                 self.send_error(503, "Too many status viewers")
                 return
             VIEWER_COUNT += 1
@@ -1433,11 +1435,14 @@ class RecipientObserver:
     def observe_once(self):
         if not self.ip:
             return
-        deadline = time.monotonic() + 2
+        cycle_start = time.monotonic()
         for key, name, args, service, field in (
             ("playback", "GetTransportInfo", "", "AVTransport", "CurrentTransportState"),
             ("volume", "GetVolume", "<Channel>Master</Channel>", "RenderingControl", "CurrentVolume")
         ):
+            # Give playback at most half the cycle; volume keeps the remaining
+            # budget even if the playback endpoint times out.
+            deadline = cycle_start + (1 if key == "playback" else 2)
             try:
                 value = self.read(name, args, service, field, deadline)
             except UnsupportedObservation:

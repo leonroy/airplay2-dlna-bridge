@@ -194,7 +194,7 @@ def observer(bridge):
     return instance
 
 
-def test_observer_uses_only_read_actions_and_shares_cycle_deadline(bridge, monkeypatch):
+def test_observer_uses_only_read_actions_and_reserves_volume_budget(bridge, monkeypatch):
     instance = observer(bridge)
     calls = []
 
@@ -214,10 +214,34 @@ def test_observer_uses_only_read_actions_and_shares_cycle_deadline(bridge, monke
     value = instance.snapshot()
     assert value['playback']['value'] == 'PLAYING'
     assert value['volume']['value'] == 38
-    assert calls[0]['deadline'] == calls[1]['deadline']
+    assert calls[1]['deadline'] - calls[0]['deadline'] == 1
     assert all(call['max_bytes'] == bridge.SOAP_BODY_MAX for call in calls)
     assert 'GetTransportInfo' in calls[0]['headers']['SOAPACTION']
     assert 'GetVolume' in calls[1]['headers']['SOAPACTION']
+
+
+def test_playback_timeout_leaves_time_for_volume_request(bridge, monkeypatch):
+    instance = observer(bridge)
+    now = [100.0]
+    monkeypatch.setattr(bridge.time, 'monotonic', lambda: now[0])
+    calls = []
+
+    def request(url, **kwargs):
+        calls.append(url)
+        assert kwargs['deadline'] > now[0]
+        if url.endswith('/control'):
+            now[0] = kwargs['deadline']
+            raise TimeoutError('playback timed out')
+        now[0] += .1
+        return soap('GetVolume', 'CurrentVolume', '38', 'RenderingControl')
+
+    monkeypatch.setattr(bridge, 'http_req', request)
+    instance.observe_once()
+    assert len(calls) == 2 and calls[1].endswith('/volume')
+    assert instance.snapshot()['playback']['error'] == 'connection'
+    assert instance.snapshot()['volume']['value'] == 38
+    assert instance.snapshot()['volume']['error'] is None
+    assert now[0] <= 102
 
 
 @pytest.mark.parametrize('raw,error', [

@@ -98,6 +98,7 @@ The browser closes the connection when the page is hidden.
 A separate worker reads recipient playback state and hardware volume while viewers are connected.
 It checks every five seconds after the previous check completes.
 All viewers share the results. Each check has a two-second total deadline.
+Playback uses at most the first second, leaving time to read volume even if playback times out.
 Unsupported fields show as unavailable. Observations older than 15 seconds show as stale.
 Endpoint status describes received audio; it does not confirm that AirPlay discovery works.
 The recipient description URL is `http://<recipient-address>:49152/description.xml` by default.
@@ -105,7 +106,12 @@ For another description port, set `RENDERER_PORT` in the bridge container enviro
 
 Log history stays in memory, with limits of 500 entries and 512 KiB.
 Individual messages are limited to 4 KiB. Up to eight live status viewers can connect.
+The viewer limit also leaves one HTTP connection slot for audio. With
+`HTTP_MAX_CONNECTIONS=1`, live status connections are disabled.
 Slow log viewers skip expired messages. History resets when the bridge process restarts.
+The page warns when a log sequence gap appears after reconnecting.
+If the browser closes an event source after an HTTP error, the page retries after
+one second and doubles the delay up to 30 seconds until the connection opens.
 The page shows bridge application messages, not complete Docker output or Shairport Sync logs.
 
 For fictional sample data, open `/?demo=playing`, `/?demo=idle`, `/?demo=waiting`, or `/?demo=failure`.

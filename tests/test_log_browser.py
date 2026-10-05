@@ -1,6 +1,7 @@
 """Exercise the playback and log UI with synthetic events and an isolated browser."""
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -43,24 +44,39 @@ def bridge_page(browser, bridge):
     page.add_init_script("""
       (() => {
         const sources = [];
+        window.NativeEventSource = window.EventSource;
+        let failures = 0;
         window.EventSource = class extends EventTarget {
+          static CLOSED = 2;
           constructor(url) {
-            super(); this.url = url; this.closed = false; sources.push(this);
+            super(); this.url = url; this.closed = false; this.readyState = 0; sources.push(this);
             queueMicrotask(() => {
               if (this.closed) return;
+              if (failures > 0) {
+                failures--; this.readyState = 2; this.dispatchEvent(new Event('error')); return;
+              }
+              this.readyState = 1;
               this.dispatchEvent(new Event('open'));
               this.dispatchEvent(new MessageEvent('status', {data: JSON.stringify(STATUS)}));
             });
           }
-          close() { this.closed = true; }
+          close() { this.closed = true; this.readyState = 2; }
         };
         const current = () => sources.findLast(source => !source.closed && source.url.includes('logs=1'));
         window.testLogs = {
+          count() { return sources.length; },
+          failClosedAttempts(count) {
+            failures = count;
+            current().readyState = 2;
+            current().dispatchEvent(new Event('error'));
+          },
+          gap() { current().dispatchEvent(new MessageEvent('gap', {data: '{}'})); },
           status(value) {
             const source = sources.findLast(source => !source.closed);
             source.dispatchEvent(new MessageEvent('status', {data: JSON.stringify(value)}));
           },
           reconnect(value) {
+            current().readyState = 1;
             current().dispatchEvent(new Event('open'));
             this.status(value);
           },
@@ -69,7 +85,7 @@ def bridge_page(browser, bridge):
             if (!source) throw new Error('No live log subscription');
             for (const entry of entries) source.dispatchEvent(new MessageEvent('log', {data: JSON.stringify(entry)}));
           },
-          disconnect() { current().dispatchEvent(new Event('error')); }
+          disconnect() { current().readyState = 0; current().dispatchEvent(new Event('error')); }
         };
       })();
     """.replace("STATUS", json.dumps(bridge.status_snapshot())))
@@ -296,3 +312,68 @@ def test_keyboard_closes_popups_restores_focus_and_resumes_logs(log_page):
     page.keyboard.press("Escape")
     expect(page.locator("#panel")).not_to_be_visible()
     expect(button).to_be_focused()
+
+
+def test_closed_sources_retry_with_backoff_and_recover(log_page, bridge):
+    page = log_page
+    page.clock.install()
+    page.clock.pause_at(datetime.now() + timedelta(seconds=1))
+    initial = page.evaluate('window.testLogs.count()')
+    page.evaluate('window.testLogs.failClosedAttempts(2)')
+    expect(page.locator('#log-state')).to_have_text('Reconnecting…')
+    page.clock.run_for(999)
+    assert page.evaluate('window.testLogs.count()') == initial
+    page.clock.run_for(1)
+    assert page.evaluate('window.testLogs.count()') == initial + 1
+    page.clock.run_for(1999)
+    assert page.evaluate('window.testLogs.count()') == initial + 1
+    page.clock.run_for(1)
+    assert page.evaluate('window.testLogs.count()') == initial + 2
+    page.clock.run_for(3999)
+    assert page.evaluate('window.testLogs.count()') == initial + 2
+    page.clock.run_for(1)
+    assert page.evaluate('window.testLogs.count()') == initial + 3
+    expect(page.locator('#log-state')).to_have_text('Live')
+    page.evaluate('value => window.testLogs.status(value)', playing_status(bridge))
+    expect(page.locator('#status-text')).to_contain_text('Receiving AirPlay')
+    expect(page.locator('#issue')).to_be_hidden()
+
+
+def test_native_event_source_recovers_after_http_503(bridge_page, bridge):
+    page = bridge_page
+    attempts = []
+    data = playing_status(bridge, title='Recovered after overload')
+
+    def events(route):
+        attempts.append(route.request.url)
+        if len(attempts) == 1:
+            route.fulfill(status=503, body='Busy')
+        else:
+            route.fulfill(content_type='text/event-stream',
+                          body=f'event: status\ndata: {json.dumps(data)}\n\n')
+
+    page.route('**/api/events*', events)
+    page.evaluate('() => { window.EventSource = window.NativeEventSource; }')
+    page.get_by_role('button', name='Open menu').click()
+    page.get_by_role('button', name='Live logs', exact=True).click()
+    expect(page.locator('#log-state')).to_have_text('Reconnecting…')
+    expect(page.locator('#title')).to_have_text('Recovered after overload', timeout=5000)
+    # fulfill() ends the successful stream immediately. Receiving the new
+    # title proves recovery; EOF can legitimately return the UI to reconnecting.
+    assert len(attempts) >= 2
+
+
+def test_reconnected_log_sequence_jump_reports_expired_history(log_page):
+    page = log_page
+    emit(page, 1, 1)
+    page.evaluate('window.testLogs.disconnect()')
+    # The native reconnect replays retained history with no backend gap event.
+    emit(page, 5, 1)
+    warning = page.locator('#log-output > span').filter(has_text='Some older log lines expired.')
+    expect(warning).to_have_count(1)
+    emit(page, 5, 1)
+    expect(warning).to_have_count(1)
+    # An explicit backend gap must not cause a second warning for the same jump.
+    page.evaluate('window.testLogs.gap()')
+    emit(page, 9, 1)
+    expect(warning).to_have_count(2)
