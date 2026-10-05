@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#161616">
+  <title>AirPlay Bridge</title>
+  <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64 128x128 256x256">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" sizes="any">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="ambience" aria-hidden="true"><img id="backdrop" class="visible" src="/placeholder.svg" alt=""><img id="backdrop-next" src="/placeholder.svg" alt=""></div>
+  <header>
+    <a id="speaker-name" class="brand" href="/">AirPlay Bridge</a>
+    <span id="demo-label" class="demo-label" hidden>Demo</span>
+    <button id="menu-button" class="icon-button" aria-label="Open menu" aria-expanded="false" aria-controls="menu">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/></svg>
+    </button>
+    <nav id="menu" aria-label="Page menu" hidden>
+      <button data-panel="details">Connection details</button>
+      <button data-panel="logs">Live logs</button>
+    </nav>
+  </header>
+  <main>
+    <section class="player" aria-label="Now playing">
+      <div class="cover"><img id="artwork" src="/placeholder.svg" alt="No cover art"></div>
+      <div class="track">
+        <p class="eyebrow">AIRPLAY / NOW PLAYING</p>
+        <h1 id="title">Ready for AirPlay</h1>
+        <p id="artist" class="artist">Select the bridge from your AirPlay menu.</p>
+        <p id="album" class="album"></p>
+      </div>
+      <div class="playback-info">
+        <p id="status" class="status" role="status"><span class="dot"></span><span id="status-text">Connecting to bridge…</span></p>
+        <p id="codec" class="format"></p>
+        <p id="format" class="format"></p>
+        <p id="volume" class="volume"></p>
+      </div>
+      <button id="issue" class="issue" hidden></button>
+    </section>
+    <noscript><p class="noscript">Enable JavaScript to see live status.</p></noscript>
+  </main>
+  <footer>AirPlay in. Music out.</footer>
+  <dialog id="panel" aria-labelledby="panel-title">
+    <div class="panel-heading"><h2 id="panel-title">Connection details</h2><button id="close-panel" class="icon-button" aria-label="Close panel">✕</button></div>
+    <section id="details-view">
+      <p class="panel-intro">Live observations from the bridge and recipient.</p>
+      <dl id="details"></dl>
+      <p class="fine-print">Endpoint status reflects received audio. It does not confirm AirPlay discovery.</p>
+    </section>
+    <section id="logs-view" hidden>
+      <p class="panel-intro">Bridge application logs</p>
+      <div class="log-toolbar"><span id="log-state">Connecting…</span></div>
+      <div class="log-area">
+        <pre id="log-output" tabindex="0" aria-label="Recent bridge log messages"></pre>
+        <button id="new-logs" class="new-logs" hidden>0 new ↓</button>
+      </div>
+      <p class="fine-print">Recent messages from this bridge process. History resets when it restarts. Shairport Sync and other Docker output are not included.</p>
+    </section>
+  </dialog>
+</body>
+</html>

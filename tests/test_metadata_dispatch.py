@@ -7,6 +7,32 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.mark.parametrize('stream_type,version', [('Classic', 1), ('Realtime', 2), ('Buffered', 2)])
+@pytest.mark.parametrize('codec', ['AAC', 'ALAC', 'PCM'])
+def test_source_metadata_reports_negotiated_codec_and_protocol_and_resets(bridge, stream_type, version, codec):
+    renderer = Mock()
+    pending = {}
+    bridge.handle_playback_metadata('styp', stream_type.encode(), renderer, pending)
+    bridge.handle_playback_metadata('sdsc', f'{codec}/48000/F24/2'.encode(), renderer, pending)
+    bridge.handle_playback_metadata('pbeg', b'', renderer, pending)
+    audio = bridge.status_snapshot()['audio']
+    assert audio['airplay_version'] == version
+    assert audio['codec'] == codec
+    bridge.handle_playback_metadata('pend', b'', renderer, pending)
+    audio = bridge.status_snapshot()['audio']
+    assert audio['codec'] is None
+    assert audio['airplay_version'] is None
+
+
+def test_unrecognized_source_metadata_does_not_guess_airplay_version(bridge):
+    renderer = Mock()
+    bridge.handle_playback_metadata('styp', b'Unknown', renderer, {})
+    bridge.handle_playback_metadata('sdsc', b'invalid\xff', renderer, {})
+    audio = bridge.status_snapshot()['audio']
+    assert audio['airplay_version'] is None
+    assert audio['codec'] is None
+
+
 def item(code, data=b''):
     encoded = b'\n<data encoding="base64">\n' + base64.b64encode(data) + b'</data>' if data else b''
     return (b'<item><type>73736e63</type><code>' + code.encode().hex().encode()

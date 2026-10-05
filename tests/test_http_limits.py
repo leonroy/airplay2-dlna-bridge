@@ -94,6 +94,23 @@ def test_connection_limit_rejects_before_thread_start_and_recovers(http_server):
     assert server.started == 3
 
 
+@pytest.mark.parametrize('limit', [1, 2, 4])
+def test_status_viewers_reserve_a_slot_for_audio(http_server, bridge, limit):
+    bridge.AUDIO.begin()
+    bridge.AUDIO.describe('44100/S16_LE/2')
+    bridge.AUDIO.feed(b'\0' * 1024)
+    server = http_server(max_connections=limit)
+    for _ in range(limit - 1):
+        viewer = server.connect(b'GET /api/events HTTP/1.0\r\n\r\n')
+        assert response_headers(viewer).startswith(b'HTTP/1.0 200')
+    rejected = server.connect(b'GET /api/events HTTP/1.0\r\n\r\n')
+    assert response_headers(rejected).startswith(b'HTTP/1.0 503')
+    rejected.close()
+    wait_until(lambda: server.active == limit - 1)
+    audio = server.connect(b'GET /stream.wav HTTP/1.0\r\n\r\n')
+    assert response_headers(audio).startswith(b'HTTP/1.0 200')
+
+
 def test_connection_permit_recovers_if_handler_thread_cannot_start(
         monkeypatch, http_server):
     start = threading.Thread.start
