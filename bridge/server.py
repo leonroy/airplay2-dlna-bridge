@@ -1161,12 +1161,13 @@ def description_control(description, ip, service):
         name = next((item.text for item in device
                      if item.tag.rsplit("}", 1)[-1] == "friendlyName"), None)
         speaker_name = name.strip()[:256] if name and name.strip() else None
-    expected = f"urn:schemas-upnp-org:service:{service}:1"
+    # Newer service versions include version-one functionality (UPnP UDA 2.0 §1.2.2).
+    expected = re.compile(rf"urn:schemas-upnp-org:service:{re.escape(service)}:0*[1-9][0-9]*")
     for item in root.iter():
         if item.tag.rsplit("}", 1)[-1] != "service":
             continue
         values = {child.tag.rsplit("}", 1)[-1]: (child.text or "").strip() for child in item}
-        if values.get("serviceType") != expected or not values.get("controlURL"):
+        if not expected.fullmatch(values.get("serviceType", "")) or not values.get("controlURL"):
             continue
         control = urllib.parse.urljoin(renderer_base_url(ip) + "/", values["controlURL"])
         parts = urllib.parse.urlsplit(control)

@@ -229,6 +229,53 @@ def test_both_workers_discover_xml_endpoints_and_build_soap(bridge, monkeypatch,
 
 
 @pytest.mark.parametrize('worker', ['command', 'observation'])
+@pytest.mark.parametrize('service', ['AVTransport', 'RenderingControl'])
+@pytest.mark.parametrize('version', ['1', '2', '3', '02'])
+def test_newer_services_accept_version_one_commands_and_observations(bridge, monkeypatch, worker, service, version):
+    if service == 'AVTransport':
+        name, args, field, value = 'GetTransportInfo', '', 'CurrentTransportState', 'PLAYING'
+        expected = 'PLAYING'
+    else:
+        name, args, field, value = 'GetVolume', '<Channel>Master</Channel>', 'CurrentVolume', '25'
+        expected = 25
+    calls = []
+    def request(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith('/description.xml'):
+            return (
+                '<root><service>'
+                f'<serviceType>urn:schemas-upnp-org:service:{service}:{version}</serviceType>'
+                '<controlURL>/control</controlURL></service></root>'
+            ).encode()
+        return (f'<u:{name}Response xmlns:u="urn:schemas-upnp-org:service:{service}:1">'
+                f'<{field}>{value}</{field}></u:{name}Response>').encode()
+    monkeypatch.setattr(bridge, 'http_req', request)
+    if worker == 'command':
+        instance = bridge.Renderer('192.0.2.10')
+        assert instance.action(name, args, service)
+    else:
+        instance = bridge.RecipientObserver('192.0.2.10')
+        assert instance.read(name, args, service, field, time.monotonic() + 2) == expected
+    assert instance.controls[service] == 'http://192.0.2.10:49152/control'
+    assert len(calls) == 2
+    assert calls[0][1]['deadline'] == calls[1][1]['deadline']
+    # Use only version-one functionality even when discovery advertises newer versions.
+    assert calls[1][1]['headers']['SOAPACTION'] == f'"urn:schemas-upnp-org:service:{service}:1#{name}"'
+    root = bridge.ElementTree.fromstring(calls[1][1]['data'])
+    assert root.find(f'.//{{urn:schemas-upnp-org:service:{service}:1}}{name}') is not None
+
+
+@pytest.mark.parametrize('suffix', ['0', '-1', '2.0', 'two', '2:extra', '2x', ''])
+def test_discovery_rejects_invalid_service_versions(bridge, suffix):
+    description = (
+        '<root><service>'
+        f'<serviceType>urn:schemas-upnp-org:service:AVTransport:{suffix}</serviceType>'
+        '<controlURL>/wrong</controlURL></service></root>'
+    ).encode()
+    assert bridge.description_control(description, '192.0.2.10', 'AVTransport')[0] is None
+
+
+@pytest.mark.parametrize('worker', ['command', 'observation'])
 @pytest.mark.parametrize('control', [
     'http://192.0.2.11:49152/control', 'http://192.0.2.10:8080/control',
     'https://192.0.2.10:49152/control', 'http://user:password@192.0.2.10:49152/control',
