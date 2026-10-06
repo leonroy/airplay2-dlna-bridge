@@ -9,7 +9,7 @@
 - the shairport metadata pipe drives UPnP Play/Stop, hardware volume, and
   now-playing DIDL pushes on the renderer
 """
-import base64, collections, json, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
+import base64, collections, hashlib, json, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
@@ -454,21 +454,44 @@ class AudioStream:
 
 AUDIO = AudioStream()
 NOW_PLAYING = {"title": "", "artist": "", "album": "", "artwork": ""}
-# seed the artwork id from the clock so /art-<id>.jpg URLs never repeat across
-# restarts: a renderer that cached art-1.jpg from a previous run would otherwise
-# show that stale cover for the first track instead of re-fetching the new one
-ART = {"id": int(time.time()), "bytes": b"", "hash": None, "mime": "image/jpeg"}
+# Content IDs keep a cached URL tied to the same bytes across restarts.
+ART = {"id": None, "bytes": b"", "mime": "image/jpeg"}
 # recent artworks kept by id: a renderer lagging behind rapid track changes may
 # fetch an older /art-<id>.jpg after ART has moved on - serve THAT push's image,
 # not whatever is current, so it never caches the wrong cover for a track
-ART_CACHE = {}
+ART_CACHE = collections.OrderedDict()
 ART_CACHE_MAX = 16
 
 
 def cache_art(art_id, data, mime):
     ART_CACHE[art_id] = (data, mime)
+    ART_CACHE.move_to_end(art_id)
     while len(ART_CACHE) > ART_CACHE_MAX:
-        del ART_CACHE[min(ART_CACHE)]
+        ART_CACHE.popitem(last=False)
+
+
+def update_artwork(data, mime=None):
+    """Publish artwork from either metadata protocol under the audio lock."""
+    if not isinstance(data, bytes) or not data:
+        return False
+    art_id = hashlib.sha256(data).hexdigest()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif not isinstance(mime, str) or not mime:
+        mime = "image/jpeg"
+    with AUDIO.lock:
+        if ART["id"] == art_id and ART["bytes"] == data:
+            return False
+        ART.update(id=art_id, bytes=data, mime=mime)
+        cache_art(art_id, data, mime)
+        NOW_PLAYING["artwork"] = f"{STREAM_URL.rsplit('/', 1)[0]}/art-{art_id}.jpg"
+        mark_metadata_dirty()
+        log(f"artwork updated ({len(data)} bytes, {mime})")
+        return True
+
+
 # WiiM's display only reads DIDL (it ignores ICY), so a track change needs a
 # SetAVTransportURI push; the player restarts the stream on it (~2-4s gap).
 DIDL_PUSH = os.environ.get("DIDL_PUSH", "1") == "1"
@@ -825,8 +848,8 @@ class StreamHandler(BaseHTTPRequestHandler):
                 VIEWERS.notify_all()
 
     def serve_art(self):
-        m = re.search(r"/art-(\d+)", self.path)
-        entry = ART_CACHE.get(int(m.group(1))) if m else None
+        m = re.fullmatch(r"/art-([0-9a-f]{64})\.jpg", self.path)
+        entry = ART_CACHE.get(m.group(1)) if m else None
         # An expired URL must never serve a different track's current cover.
         if entry is None:
             self.send_error(404)
@@ -1123,6 +1146,54 @@ PlaybackSnapshot = collections.namedtuple(
     "PlaybackSnapshot", "session revision title artist album art_id artwork url")
 
 
+def renderer_base_url(ip):
+    host = f"[{ip}]" if ":" in ip else ip
+    return f"http://{host}:{RENDERER_PORT}"
+
+
+def description_control(description, ip, service):
+    """Parse a service endpoint without allowing discovery to change the target."""
+    root = ElementTree.fromstring(description)
+    device = next((item for item in root.iter()
+                   if item.tag.rsplit("}", 1)[-1] == "device"), None)
+    speaker_name = None
+    if device is not None:
+        name = next((item.text for item in device
+                     if item.tag.rsplit("}", 1)[-1] == "friendlyName"), None)
+        speaker_name = name.strip()[:256] if name and name.strip() else None
+    expected = f"urn:schemas-upnp-org:service:{service}:1"
+    for item in root.iter():
+        if item.tag.rsplit("}", 1)[-1] != "service":
+            continue
+        values = {child.tag.rsplit("}", 1)[-1]: (child.text or "").strip() for child in item}
+        if values.get("serviceType") != expected or not values.get("controlURL"):
+            continue
+        control = urllib.parse.urljoin(renderer_base_url(ip) + "/", values["controlURL"])
+        parts = urllib.parse.urlsplit(control)
+        try:
+            same_target = (parts.scheme == "http" and parts.username is None
+                           and parts.password is None and parts.hostname is not None
+                           and ipaddress.ip_address(parts.hostname) == ipaddress.ip_address(ip)
+                           and parts.port == RENDERER_PORT)
+        except ValueError:
+            same_target = False
+        if not same_target:
+            raise ValueError("Renderer control URL changed the target")
+        return control, speaker_name
+    return None, speaker_name
+
+
+def soap_request(name, args, service):
+    """Build the shared SOAP request; each worker handles its own response."""
+    srv = f"urn:schemas-upnp-org:service:{service}:1"
+    body = (f'<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            f'<s:Body><u:{name} xmlns:u="{srv}"><InstanceID>0</InstanceID>{args}'
+            f'</u:{name}></s:Body></s:Envelope>')
+    return body.encode(), {"Content-Type": 'text/xml; charset="utf-8"',
+                           "SOAPACTION": f'"{srv}#{name}"'}
+
+
 class Renderer:
     """Nonblocking publishers plus one worker that owns all renderer I/O."""
     RETRY_DELAYS = (0.25, 0.5, 1.0)
@@ -1141,17 +1212,11 @@ class Renderer:
         if not self.ip:
             return None
         if service not in self.controls:
-            host = f"[{self.ip}]" if ":" in self.ip else self.ip
-            desc = http_req(f"http://{host}:{RENDERER_PORT}/description.xml",
-                            deadline=deadline).decode(errors="replace")
-            m = re.search(rf"<service>(?:(?!</service>).)*?{service}(?:(?!</service>).)*?"
-                          r"<controlURL>([^<]+)</controlURL>", desc, re.S)
-            if m:
-                path = m.group(1)
-                self.controls[service] = (f"http://{host}:{RENDERER_PORT}"
-                                          f"{path if path.startswith('/') else '/' + path}")
-            else:
+            desc = http_req(renderer_base_url(self.ip) + "/description.xml", deadline=deadline)
+            control, _ = description_control(desc, self.ip, service)
+            if control is None:
                 raise ValueError(f"renderer has no {service} control URL")
+            self.controls[service] = control
         return self.controls.get(service)
 
     def action(self, name, args, service="AVTransport"):
@@ -1164,13 +1229,8 @@ class Renderer:
             if not control:
                 return False
             srv = f"urn:schemas-upnp-org:service:{service}:1"
-            body = (f'<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-                    f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
-                    f'<u:{name} xmlns:u="{srv}"><InstanceID>0</InstanceID>{args}</u:{name}>'
-                    f'</s:Body></s:Envelope>')
-            response = http_req(control, data=body.encode(), headers={
-                "Content-Type": 'text/xml; charset="utf-8"',
-                "SOAPACTION": f'"{srv}#{name}"'}, deadline=deadline,
+            body, headers = soap_request(name, args, service)
+            response = http_req(control, data=body, headers=headers, deadline=deadline,
                 max_bytes=SOAP_BODY_MAX)
             document = ElementTree.fromstring(response)
             if any(element.tag.rsplit("}", 1)[-1] == "Fault" for element in document.iter()):
@@ -1382,40 +1442,18 @@ class RecipientObserver:
         self.stopping = threading.Event()
 
     def read(self, name, args, service, field, deadline):
-        host = f"[{self.ip}]" if ":" in self.ip else self.ip
         if service not in self.controls:
-            desc = http_req(f"http://{host}:{RENDERER_PORT}/description.xml", deadline=deadline)
-            root = ElementTree.fromstring(desc)
-            device = next((item for item in root if item.tag.rsplit("}", 1)[-1] == "device"), None)
-            if device is not None:
-                speaker_name = next((item.text for item in device
-                             if item.tag.rsplit("}", 1)[-1] == "friendlyName"), None)
-                with self.lock:
-                    self.name = speaker_name.strip()[:256] if speaker_name and speaker_name.strip() else None
-            for item in root.iter():
-                if item.tag.rsplit("}", 1)[-1] != "service":
-                    continue
-                values = {child.tag.rsplit("}", 1)[-1]: child.text for child in item}
-                if values.get("serviceType") == f"urn:schemas-upnp-org:service:{service}:1":
-                    path = values.get("controlURL")
-                    if path:
-                        control = urllib.parse.urljoin(f"http://{host}:{RENDERER_PORT}/", path)
-                        parts = urllib.parse.urlsplit(control)
-                        if (parts.scheme != "http" or parts.username or parts.password
-                                or parts.hostname != self.ip or parts.port != RENDERER_PORT):
-                            raise ValueError("Recipient control URL changed the target")
-                        self.controls[service] = control
-                        break
-            if service not in self.controls:
+            desc = http_req(renderer_base_url(self.ip) + "/description.xml", deadline=deadline)
+            control, speaker_name = description_control(desc, self.ip, service)
+            with self.lock:
+                self.name = speaker_name
+            if control is None:
                 raise UnsupportedObservation("Service unavailable")
+            self.controls[service] = control
         srv = f"urn:schemas-upnp-org:service:{service}:1"
-        body = (f'<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-                f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-                f'<s:Body><u:{name} xmlns:u="{srv}"><InstanceID>0</InstanceID>{args}'
-                f'</u:{name}></s:Body></s:Envelope>')
-        raw = http_req(self.controls[service], data=body.encode(), headers={
-            "Content-Type": 'text/xml; charset="utf-8"', "SOAPACTION": f'"{srv}#{name}"'
-        }, deadline=deadline, max_bytes=SOAP_BODY_MAX, allowed_statuses=(500,))
+        body, headers = soap_request(name, args, service)
+        raw = http_req(self.controls[service], data=body, headers=headers,
+                       deadline=deadline, max_bytes=SOAP_BODY_MAX, allowed_statuses=(500,))
         root = ElementTree.fromstring(raw)
         elements = list(root.iter())
         fault = next((item for item in elements if item.tag.rsplit("}", 1)[-1] == "Fault"), None)
@@ -1564,16 +1602,7 @@ def _handle_copl_locked(data):
             elif k.endswith("NowPlayingInfoArtworkMIMEType"):
                 mime = v
 
-    if isinstance(art, bytes) and art:
-        h = hash(art)
-        if h != ART["hash"]:
-            ART.update(id=ART["id"] + 1, bytes=art, hash=h,
-                       mime=mime if isinstance(mime, str) and mime else "image/jpeg")
-            cache_art(ART["id"], art, ART["mime"])
-            NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
-                STREAM_URL.rsplit("/", 1)[0], ART["id"])
-            mark_metadata_dirty()
-            log(f"artwork updated ({len(art)} bytes, {ART['mime']})")
+    update_artwork(art, mime)
 
     if isinstance(title, str) and title and (
             title != NOW_PLAYING["title"] or (artist or "") != NOW_PLAYING["artist"]):
@@ -1628,7 +1657,7 @@ def handle_playback_metadata(code, data, wiim, pending):
                 AUDIO.begin()
                 pending.clear()
                 NOW_PLAYING.update(title="", artist="", album="", artwork="")
-                ART.update(bytes=b"", hash=None)
+                ART.update(id=None, bytes=b"")
                 STATE.update(active=True, pushed=None)
                 mark_metadata_dirty()
             else:
@@ -1639,7 +1668,7 @@ def handle_playback_metadata(code, data, wiim, pending):
             AUDIO.end("pend received")
             pending.clear()
             NOW_PLAYING.update(title="", artist="", album="", artwork="")
-            ART.update(bytes=b"", hash=None)
+            ART.update(id=None, bytes=b"")
             STATE.update(active=False, dirty=0.0, pushed=None)
             wiim.stop(session_id)
         cancel_session_clients(session_id, "session end")
@@ -1699,15 +1728,7 @@ def metadata_reader(wiim):
                             except (ValueError, IndexError):
                                 pass
                         elif typ == "ssnc" and code == "PICT" and data:
-                            with AUDIO.lock:
-                                h = hash(data)
-                                if h != ART["hash"]:
-                                    ART.update(id=ART["id"] + 1, bytes=data, hash=h)
-                                    cache_art(ART["id"], data, ART["mime"])
-                                    NOW_PLAYING["artwork"] = "%s/art-%d.jpg" % (
-                                        STREAM_URL.rsplit("/", 1)[0], ART["id"])
-                                    mark_metadata_dirty()
-                                    log(f"artwork updated ({len(data)} bytes)")
+                            update_artwork(data)
                         elif typ == "ssnc" and code == "mden":
                             with AUDIO.lock:
                                 if pending.get("minm") and (

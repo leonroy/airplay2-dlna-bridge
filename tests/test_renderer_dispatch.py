@@ -182,11 +182,110 @@ def test_resolve_and_action_share_deadline(bridge, monkeypatch):
     def request(url, **kwargs):
         deadlines.append(kwargs['deadline'])
         if 'description.xml' in url:
-            return b'<service><serviceType>AVTransport</serviceType><controlURL>/control</controlURL></service>'
+            return b'<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/control</controlURL></service>'
         return b'<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>'
     monkeypatch.setattr(bridge, 'http_req', request)
     assert renderer.action('Play', '')
     assert len(deadlines) == 2 and deadlines[0] == deadlines[1]
+
+
+@pytest.mark.parametrize('worker', ['command', 'observation'])
+@pytest.mark.parametrize('namespace', ['', 'default', 'prefixed'])
+@pytest.mark.parametrize('control', ['/control', 'control', 'http://192.0.2.10:49152/control'])
+def test_both_workers_discover_xml_endpoints_and_build_soap(bridge, monkeypatch, worker, namespace, control):
+    prefix = 'd:' if namespace == 'prefixed' else ''
+    declaration = (' xmlns:d="urn:schemas-upnp-org:device-1-0"' if namespace == 'prefixed'
+                   else ' xmlns="urn:schemas-upnp-org:device-1-0"' if namespace == 'default' else '')
+    description = (
+        f'<{prefix}root{declaration}><{prefix}device><{prefix}friendlyName> Example Speaker </{prefix}friendlyName>'
+        f'<{prefix}service><{prefix}serviceType>urn:schemas-upnp-org:service:AVTransport:1</{prefix}serviceType>'
+        f'<{prefix}controlURL>{control}</{prefix}controlURL></{prefix}service>'
+        f'</{prefix}device></{prefix}root>'
+    ).encode()
+    calls = []
+    def request(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith('/description.xml'):
+            return description
+        return (b'<u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                b'<CurrentTransportState>PLAYING</CurrentTransportState></u:GetTransportInfoResponse>')
+    monkeypatch.setattr(bridge, 'http_req', request)
+    if worker == 'command':
+        instance = bridge.Renderer('192.0.2.10')
+        assert instance.action('GetTransportInfo', '')
+    else:
+        instance = bridge.RecipientObserver('192.0.2.10')
+        assert instance.read('GetTransportInfo', '', 'AVTransport', 'CurrentTransportState', time.monotonic() + 2) == 'PLAYING'
+        assert instance.snapshot()['name'] == 'Example Speaker'
+    assert instance.controls['AVTransport'] == 'http://192.0.2.10:49152/control'
+    assert len(calls) == 2
+    assert calls[0][1]['deadline'] == calls[1][1]['deadline']
+    body = bridge.ElementTree.fromstring(calls[1][1]['data'])
+    action = body.find('.//{urn:schemas-upnp-org:service:AVTransport:1}GetTransportInfo')
+    assert action.find('InstanceID').text == '0'
+    assert calls[1][1]['headers']['SOAPACTION'] == '"urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo"'
+    assert calls[1][1]['max_bytes'] == bridge.SOAP_BODY_MAX
+    assert calls[1][1].get('allowed_statuses', ()) == ((500,) if worker == 'observation' else ())
+
+
+@pytest.mark.parametrize('worker', ['command', 'observation'])
+@pytest.mark.parametrize('control', [
+    'http://192.0.2.11:49152/control', 'http://192.0.2.10:8080/control',
+    'https://192.0.2.10:49152/control', 'http://user:password@192.0.2.10:49152/control',
+    'http://example.invalid:49152/control',
+])
+def test_both_workers_reject_discovery_that_changes_the_target(bridge, monkeypatch, worker, control):
+    request = Mock(return_value=(
+        '<root><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>'
+        f'<controlURL>{control}</controlURL></service></root>'
+    ).encode())
+    monkeypatch.setattr(bridge, 'http_req', request)
+    with pytest.raises(ValueError, match='changed the target'):
+        if worker == 'command':
+            bridge.Renderer('192.0.2.10').resolve('AVTransport', time.monotonic() + 2)
+        else:
+            bridge.RecipientObserver('192.0.2.10').read(
+                'GetTransportInfo', '', 'AVTransport', 'CurrentTransportState', time.monotonic() + 2)
+    assert request.call_count == 1
+
+
+def test_discovery_matches_exact_service_and_preserves_independent_caches(bridge, monkeypatch):
+    descriptions = [
+        b'<root><service><serviceType>urn:schemas-upnp-org:service:AVTransportExtra:1</serviceType><controlURL>/wrong</controlURL></service></root>',
+        b'<root><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/command</controlURL></service></root>',
+        b'<root><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/observation</controlURL></service></root>',
+    ]
+    def request(url, **kwargs):
+        if url.endswith('/description.xml'):
+            return descriptions.pop(0)
+        return (b'<u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                b'<CurrentTransportState>STOPPED</CurrentTransportState></u:GetTransportInfoResponse>')
+    monkeypatch.setattr(bridge, 'http_req', request)
+    command, observer = bridge.Renderer('192.0.2.10'), bridge.RecipientObserver('192.0.2.10')
+    with pytest.raises(ValueError, match='no AVTransport control URL'):
+        command.resolve('AVTransport', time.monotonic() + 2)
+    command.resolve('AVTransport', time.monotonic() + 2)
+    assert observer.read('GetTransportInfo', '', 'AVTransport', 'CurrentTransportState', time.monotonic() + 2) == 'STOPPED'
+    assert command.controls['AVTransport'].endswith('/command')
+    assert observer.controls['AVTransport'].endswith('/observation')
+    assert not descriptions
+
+
+def test_discovery_accepts_same_ipv6_target_and_soap_arguments(bridge, monkeypatch):
+    renderer = bridge.Renderer('2001:db8::10')
+    calls = []
+    def request(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith('/description.xml'):
+            return (b'<root><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>'
+                    b'<controlURL>http://[2001:db8::10]:49152/control</controlURL></service></root>')
+        return b'<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>'
+    monkeypatch.setattr(bridge, 'http_req', request)
+    assert renderer.action('Play', '<Speed>1</Speed>')
+    assert calls[0][0] == 'http://[2001:db8::10]:49152/description.xml'
+    assert calls[1][0] == 'http://[2001:db8::10]:49152/control'
+    body = bridge.ElementTree.fromstring(calls[1][1]['data'])
+    assert body.find('.//Speed').text == '1'
 
 
 @pytest.mark.parametrize('trickle_headers', [False, True])
