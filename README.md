@@ -248,7 +248,8 @@ up to 16 covers or 16 MiB, whichever limit it reaches first.
 
 The reader discards invalid items and resumes at the next item. It rejects
 invalid base64, mismatched declared lengths and values above these limits.
-Rejected metadata does not stop audio playback. Valid items can span pipe reads.
+The reader skips rejected items without ending an active audio session.
+Valid items can span pipe reads.
 
 ### Initial playback timing
 
