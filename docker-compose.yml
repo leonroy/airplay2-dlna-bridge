@@ -7,19 +7,17 @@ services:
   # AirPlay 2 receiver (nqptp is bundled inside this image)
   shairport-sync:
     image: mikebrady/shairport-sync:latest
-    container_name: shairport-sync
     network_mode: host
     restart: unless-stopped
     depends_on:
       - bridge
-    command: ["-c", "/etc/shairport-sync.conf"]
+    command: ${SHAIRPORT_COMMAND:--c /etc/shairport-sync.conf}
     volumes:
       - ./shairport-sync.conf:/etc/shairport-sync.conf:ro
       - shared:/shared
 
   bridge:
     image: ghcr.io/leonroy/airplay2-dlna-bridge:${BRIDGE_IMAGE_TAG:-latest}
-    container_name: airplay2-bridge
     restart: unless-stopped
     ports:
       - "${STREAM_PORT:-8000}:8000"
@@ -38,10 +36,6 @@ services:
       # push track title/artist/album/artwork to the renderer's display on track change
       # (the player restarts the stream on each push: ~2-4s gap per track; 0 = off)
       - DIDL_PUSH=${DIDL_PUSH:-1}
-      # EXPERIMENTAL, off by default: on seek/pause, drop the stream so the player
-      # discards stale buffered audio (found to stall WiiM playback after seeks -
-      # it treats the connection reset as fatal and needs a Play kick to recover)
-      - FLUSH_RESYNC=${FLUSH_RESYNC:-0}
     volumes:
       - shared:/shared
 

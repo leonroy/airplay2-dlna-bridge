@@ -22,13 +22,18 @@ timing. The sender, Docker host, and speaker must share a local network.
 The supplied Shairport Sync container provides the AirPlay receiver.
 Shairport Sync 5 or later is required for audio format metadata.
 
-On the Docker host, clone the repository and copy the example configuration:
+On the Docker host, create a deployment folder and download the configuration:
 
 ```bash
-git clone https://github.com/leonroy/airplay2-dlna-bridge
+mkdir airplay2-dlna-bridge
 cd airplay2-dlna-bridge
-cp .env.example .env
+curl -fL https://raw.githubusercontent.com/leonroy/airplay2-dlna-bridge/main/docker-compose.yml -o docker-compose.yml
+curl -fL https://raw.githubusercontent.com/leonroy/airplay2-dlna-bridge/main/shairport-sync.conf -o shairport-sync.conf
+curl -fL https://raw.githubusercontent.com/leonroy/airplay2-dlna-bridge/main/.env.example -o .env
 ```
+
+The deployment folder needs only these three files. Application code runs inside
+the published images. Keep source checkouts and development files elsewhere.
 
 Edit `.env` before starting the containers:
 
@@ -96,14 +101,16 @@ The main settings are:
 | `DIDL_PUSH` | `1` | Refresh track information on the speaker display. See [Playback behavior](#playback-behavior). |
 | `STREAM_PORT` | `8000` | Host port for audio, artwork, and the status page. |
 | `BRIDGE_IMAGE_TAG` | `latest` | Published bridge version. Release tags omit the leading `v`. |
-| `FLUSH_RESYNC` | `0` | Experimental stream reset on seek/pause. Keep `0` to avoid known WiiM seek stalls. |
+| `SHAIRPORT_COMMAND` | `-c /etc/shairport-sync.conf` | Receiver arguments. Set the classic command below for AirPlay 1. |
 
 Apply `.env` changes with `docker compose up -d` on the Docker host.
 To rename the AirPlay endpoint, edit `general.name` in `shairport-sync.conf`,
 then run `docker compose restart shairport-sync`.
+For AirPlay 1, change the name after `-a` in `SHAIRPORT_COMMAND` instead,
+then run `docker compose up -d shairport-sync`.
 
-The speaker's UPnP description port defaults to `49152`. For another port, add
-`RENDERER_PORT` to the bridge container's `environment` in a Compose override.
+Speaker control uses the fixed UPnP description port `49152`.
+Seek and pause do not force audio connections to close.
 If automatic control is disabled, open `http://<HOST_IP>:<STREAM_PORT>/stream.flac`
 on the speaker manually.
 
@@ -122,13 +129,23 @@ format metadata. See [RELEASING.md](RELEASING.md) for image publishing and relea
 
 ### Separate AirPlay 1 and AirPlay 2 endpoints
 
-For an additional classic AirPlay 1 endpoint, use a separate checkout and `.env`.
+For an additional classic AirPlay 1 endpoint, use a separate deployment folder and `.env`.
 Set the host and speaker addresses there, and set `STREAM_PORT=8001`.
-Keep the AirPlay 2 checkout on port `8000`, then run these commands from the AirPlay 1 checkout:
+Add this line to the AirPlay 1 `.env`:
+
+```dotenv
+SHAIRPORT_COMMAND=--service-type=classic -a "AirPlay 1 Bridge" -p 5000 -c /etc/shairport-sync.conf
+```
+
+Keep the AirPlay 2 deployment on port `8000`.
+Both deployments use the same `docker-compose.yml` from the repository.
+Compose assigns container names from each deployment folder's project name.
+Use different folder names for the two deployments.
+Run these commands from the AirPlay 1 folder:
 
 ```bash
-docker compose -p airplay1-dlna-bridge -f docker-compose.yml -f docker-compose.airplay1.yml pull
-docker compose -p airplay1-dlna-bridge -f docker-compose.yml -f docker-compose.airplay1.yml up -d
+docker compose pull
+docker compose up -d
 ```
 
 The AirPlay 1 endpoint advertises “AirPlay 1 Bridge” on RTSP port `5000`.
