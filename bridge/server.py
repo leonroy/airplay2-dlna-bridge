@@ -35,6 +35,9 @@ ICY_META_INT = 131072               # same interval airupnp uses
 RING_SECONDS = 12
 BACKLOG_SECONDS = 1.5
 PENDING_MAX = 4 * 1024 * 1024       # bound audio waiting for output-description metadata
+META_PAYLOAD_MAX = 8 * 1024 * 1024
+META_ITEM_MAX = 12 * 1024 * 1024   # base64, line breaks and XML included
+META_TEXT_MAX = 4096               # UTF-8 bytes per track field
 BOOT_TIME = time.monotonic()
 INSTANCE_ID = str(time.time_ns())
 WEB_ROOT = Path(__file__).with_name("web")
@@ -461,18 +464,25 @@ ART = {"id": None, "bytes": b"", "mime": "image/jpeg"}
 # not whatever is current, so it never caches the wrong cover for a track
 ART_CACHE = collections.OrderedDict()
 ART_CACHE_MAX = 16
+ART_ITEM_MAX = 4 * 1024 * 1024
+ART_CACHE_BYTES_MAX = 16 * 1024 * 1024
 
 
 def cache_art(art_id, data, mime):
-    ART_CACHE[art_id] = (data, mime)
-    ART_CACHE.move_to_end(art_id)
-    while len(ART_CACHE) > ART_CACHE_MAX:
-        ART_CACHE.popitem(last=False)
+    if len(data) > ART_ITEM_MAX:
+        return False
+    with AUDIO.lock:
+        ART_CACHE[art_id] = (data, mime)
+        ART_CACHE.move_to_end(art_id)
+        while (len(ART_CACHE) > ART_CACHE_MAX or
+               sum(len(entry[0]) for entry in ART_CACHE.values()) > ART_CACHE_BYTES_MAX):
+            ART_CACHE.popitem(last=False)
+    return True
 
 
 def update_artwork(data, mime=None):
     """Publish artwork from either metadata protocol under the audio lock."""
-    if not isinstance(data, bytes) or not data:
+    if not isinstance(data, bytes) or not data or len(data) > ART_ITEM_MAX:
         return False
     art_id = hashlib.sha256(data).hexdigest()
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -1565,16 +1575,34 @@ def status_snapshot():
 
 # ---------------------------------------------------------- shairport metadata
 def _walk_dicts(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _walk_dicts(v)
-    elif isinstance(obj, (list, tuple)):
-        for v in obj:
-            yield from _walk_dicts(v)
+    # Binary plists can contain shared references or cycles.
+    stack, seen, exhausted = [iter((obj,))], set(), object()
+    while stack:
+        value = next(stack[-1], exhausted)
+        if value is exhausted:
+            stack.pop()
+        elif isinstance(value, (dict, list, tuple)) and id(value) not in seen:
+            seen.add(id(value))
+            if isinstance(value, dict):
+                yield value
+                stack.append(iter(value.values()))
+            else:
+                stack.append(iter(value))
+
+
+def metadata_text(value):
+    """Accept one bounded UTF-8 track field without truncating it."""
+    if not isinstance(value, str) or len(value) > META_TEXT_MAX:
+        return None
+    try:
+        return value if len(value.encode("utf-8")) <= META_TEXT_MAX else None
+    except UnicodeError:
+        return None
 
 
 def handle_copl(data):
+    if not isinstance(data, bytes) or len(data) > META_PAYLOAD_MAX:
+        return
     with AUDIO.lock:
         _handle_copl_locked(data)
 
@@ -1593,11 +1621,11 @@ def _handle_copl_locked(data):
             if not isinstance(k, str):
                 continue
             if k.endswith("NowPlayingInfoTitle"):
-                title = v
+                title = metadata_text(v)
             elif k.endswith("NowPlayingInfoArtist"):
-                artist = v
+                artist = metadata_text(v)
             elif k.endswith("NowPlayingInfoAlbum"):
-                album = v
+                album = metadata_text(v)
             elif k.endswith("NowPlayingInfoArtworkData"):
                 art = v
             elif k.endswith("NowPlayingInfoArtworkMIMEType"):
@@ -1616,8 +1644,89 @@ def _handle_copl_locked(data):
 
 ITEM = re.compile(
     rb'<item><type>([0-9a-f]{8})</type><code>([0-9a-f]{8})</code>'
-    rb'<length>(\d+)</length>(?:\n<data encoding="base64">\n?([A-Za-z0-9+/=\s]*?)</data>)?</item>',
+    rb'<length>([0-9]{1,8})</length>(?:\s*<data encoding="base64">(.*?)</data>)?\s*</item>',
     re.S)
+ITEM_HEADER = re.compile(
+    rb'<item><type>([0-9a-f]{8})</type><code>([0-9a-f]{8})</code>'
+    rb'<length>([0-9]{1,8})</length>')
+
+
+class MetadataParser:
+    """Bound incomplete items and resume at the next item after invalid input."""
+    def __init__(self):
+        self.buffer = bytearray()
+        self.header = None
+        self.scan = 0
+
+    def _discard(self, count):
+        del self.buffer[:count]
+        self.header = None
+        self.scan = 0
+
+    def feed(self, chunk):
+        # Keep the same bound even if a caller supplies a large read.
+        for offset in range(0, len(chunk), 4096):
+            self.buffer.extend(chunk[offset:offset + 4096])
+            yield from self._items()
+
+    def _items(self):
+        while self.buffer:
+            start = self.buffer.find(b"<item>")
+            if start < 0:
+                # Retain only a possible opening tag split across reads.
+                keep = next((n for n in range(5, 0, -1)
+                             if self.buffer.endswith(b"<item>"[:n])), 0)
+                self._discard(len(self.buffer) - keep)
+                return
+            if start:
+                self._discard(start)
+            if self.header is None:
+                end = self.buffer.find(b"</length>", 0, 256)
+                if end < 0:
+                    if len(self.buffer) < 256:
+                        return
+                    self._discard(6)
+                    continue
+                match = ITEM_HEADER.fullmatch(self.buffer[:end + 9])
+                if match is None:
+                    self._discard(6)
+                    continue
+                typ, code = (bytes.fromhex(match[n].decode()).decode(errors="replace")
+                             for n in (1, 2))
+                length = int(match[3])
+                limit = (META_TEXT_MAX if typ == "core" and code in ("minm", "asar", "asal")
+                         else ART_ITEM_MAX if typ == "ssnc" and code == "PICT"
+                         else META_PAYLOAD_MAX)
+                if length > limit:
+                    self._discard(6)
+                    continue
+                self.header = (typ, code, length)
+                self.scan = end + 9
+            end = self.buffer.find(b"</item>", self.scan)
+            nested = self.buffer.find(b"<item>", self.scan)
+            if nested >= 0 and (end < 0 or nested < end):
+                self._discard(nested)
+                continue
+            if end < 0:
+                if len(self.buffer) >= META_ITEM_MAX:
+                    self._discard(6)
+                    continue
+                self.scan = max(self.scan, len(self.buffer) - 6)
+                return
+            typ, code, length = self.header
+            match = ITEM.fullmatch(self.buffer[:end + 7]) if end + 7 <= META_ITEM_MAX else None
+            self._discard(end + 7)
+            if match is None:
+                continue
+            encoded = re.sub(rb"[ \t\r\n]", b"", match[4] or b"")
+            if len(encoded) != 4 * ((length + 2) // 3):
+                continue
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except ValueError:
+                continue
+            if len(data) == length:
+                yield typ, code, data
 
 
 def handle_output_description(data, wiim):
@@ -1694,20 +1803,12 @@ def metadata_reader(wiim):
             log(f"waiting for metadata pipe writer path={META_PIPE}; {AUDIO.status()}")
             with open(META_PIPE, "rb", buffering=0) as f:
                 log(f"metadata pipe open; {AUDIO.status()}")
-                buf = b""
+                parser = MetadataParser()
                 while True:
                     chunk = f.read(4096)
                     if not chunk:
                         break
-                    buf += chunk
-                    if b"</item>" not in buf:
-                        continue
-                    pos = 0
-                    for m in ITEM.finditer(buf):
-                        pos = m.end()
-                        typ = bytes.fromhex(m.group(1).decode()).decode(errors="replace")
-                        code = bytes.fromhex(m.group(2).decode()).decode(errors="replace")
-                        data = base64.b64decode(m.group(4)) if m.group(4) else b""
+                    for typ, code, data in parser.feed(chunk):
                         sequence += 1
                         if typ == "ssnc" and code in ("odsc", "sdsc", "pbeg", "pend", "pfls", "paus", "prsm", "styp"):
                             value = f" value={description_for_log(data)}" if code in ("sdsc", "styp") else ""
@@ -1718,7 +1819,9 @@ def metadata_reader(wiim):
                         if typ == "ssnc" and code == "copl" and data:
                             handle_copl(data)
                         elif typ == "core" and code in ("minm", "asar", "asal"):
-                            pending[code] = data.decode("utf-8", errors="replace")
+                            value = metadata_text(data.decode("utf-8", errors="replace"))
+                            if value is not None:
+                                pending[code] = value
                         elif typ == "ssnc" and code == "pvol":
                             # "airplay_volume,attenuation,low,high"; airplay_volume
                             # is -30..0 dB, -144 = mute -> renderer hardware volume
@@ -1740,9 +1843,7 @@ def metadata_reader(wiim):
                                     NOW_PLAYING["album"] = pending.get("asal", "")
                                     mark_metadata_dirty()
                                     log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
-                    # a partial cover-art item can be ~700KB of base64: keep enough tail
-                    buf = buf[pos:] if pos else buf[-2097152:]
-            log(f"metadata pipe EOF unparsed_bytes={len(buf)} last_event_seq={sequence}; {AUDIO.status()}")
+            log(f"metadata pipe EOF unparsed_bytes={len(parser.buffer)} last_event_seq={sequence}; {AUDIO.status()}")
             with AUDIO.lock:
                 session_id, was_active = AUDIO.session_id, STATE["active"]
                 AUDIO.end("metadata pipe EOF")
