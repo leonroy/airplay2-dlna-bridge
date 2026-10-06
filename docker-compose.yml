@@ -1,17 +1,28 @@
-# AirPlay 2 → UPnP/DLNA renderer bridge
-# iPhone -(AirPlay2)-> shairport-sync -PCM-> bridge (FLAC over HTTP) -> renderer
+# AirPlay → UPnP/DLNA renderer bridge
+# iPhone -(AirPlay)-> shairport-sync -PCM-> bridge (FLAC over HTTP) -> renderer
 #
 # Set HOST_IP and RENDERER_IP in .env before starting (see .env.example).
 
 services:
-  # AirPlay 2 receiver (nqptp is bundled inside this image)
+  # AirPlay receiver (nqptp is bundled inside this image)
   shairport-sync:
     image: mikebrady/shairport-sync:latest
     network_mode: host
     restart: unless-stopped
     depends_on:
       - bridge
-    command: ${SHAIRPORT_COMMAND:--c /etc/shairport-sync.conf}
+    environment:
+      - AIRPLAY_VERSION=${AIRPLAY_VERSION:-2}
+      - AIRPLAY_NAME=${AIRPLAY_NAME:-}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        case "$$AIRPLAY_VERSION" in
+          1) service_type=classic ;;
+          2) service_type=airplay2 ;;
+          *) echo "Invalid AIRPLAY_VERSION: set AIRPLAY_VERSION to 1 or 2 in .env." >&2; exit 1 ;;
+        esac
+        exec ./run.sh "--service-type=$$service_type" -a "$${AIRPLAY_NAME:-AirPlay $$AIRPLAY_VERSION Bridge}"
     volumes:
       - ./shairport-sync.conf:/etc/shairport-sync.conf:ro
       - shared:/shared
