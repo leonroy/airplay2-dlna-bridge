@@ -80,7 +80,7 @@
     $("album").textContent = data.track.album || "";
     const art = data.track.artwork || "/placeholder.svg";
     // Only local artwork routes are accepted, even if a malformed status supplies a URL.
-    const safeArt = /^\/art-\d+\.jpg$/.test(art) || ["/placeholder.svg", "/demo.svg"].includes(art) ? art : "/placeholder.svg";
+    const safeArt = /^\/art-[0-9a-f]{64}\.jpg$/.test(art) || ["/placeholder.svg", "/demo.svg"].includes(art) ? art : "/placeholder.svg";
     if ($("artwork").getAttribute("src") !== safeArt) {
       $("artwork").src = safeArt; updateBackdrop(safeArt);
     }

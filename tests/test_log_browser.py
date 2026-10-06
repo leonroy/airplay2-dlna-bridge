@@ -11,6 +11,8 @@ playwright = pytest.importorskip(
     "playwright.sync_api", reason="Install requirements-browser.txt to run browser tests"
 )
 expect = playwright.expect
+ART_ONE = "/art-" + "1" * 64 + ".jpg"
+ART_TWO = "/art-" + "2" * 64 + ".jpg"
 
 
 @pytest.fixture(scope="module")
@@ -201,18 +203,18 @@ def playing_status(bridge, artwork=None, title="Once Upon a Time In the West"):
 def test_artwork_waits_for_load_then_fades_and_handles_failure(bridge_page, bridge):
     page = bridge_page
     pending = []
-    page.route("**/art-1.jpg", lambda route: pending.append(route))
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/art-1.jpg"))
-    page.wait_for_function("document.querySelector('#artwork').getAttribute('src') === '/art-1.jpg'")
+    page.route(f"**{ART_ONE}", lambda route: pending.append(route))
+    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, ART_ONE))
+    page.wait_for_function("path => document.querySelector('#artwork').getAttribute('src') === path", arg=ART_ONE)
     assert pending
     expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/placeholder.svg")
     for route in pending:
         route.fulfill(body='<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><path fill="red" d="M0 0h8v8H0z"/></svg>', content_type="image/svg+xml")
-    expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/art-1.jpg")
+    expect(page.locator(".ambience img.visible")).to_have_attribute("src", ART_ONE)
     page.wait_for_function("(() => { const opacity = Number(getComputedStyle(document.querySelector('.ambience img.visible')).opacity); return opacity > 0 && opacity < .3; })()")
     page.wait_for_function("getComputedStyle(document.querySelector('.ambience img.visible')).opacity === '0.3'")
-    page.route("**/art-2.jpg", lambda route: route.fulfill(status=404))
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/art-2.jpg"))
+    page.route(f"**{ART_TWO}", lambda route: route.fulfill(status=404))
+    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, ART_TWO))
     expect(page.locator("#artwork")).to_have_attribute("src", "/placeholder.svg")
     expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/placeholder.svg")
     expect(page.locator("#artwork")).to_have_attribute("alt", "No cover art")
@@ -223,9 +225,9 @@ def test_artwork_waits_for_load_then_fades_and_handles_failure(bridge_page, brid
 def test_late_artwork_cannot_replace_a_newer_track(bridge_page, bridge):
     page = bridge_page
     pending = []
-    page.route("**/art-1.jpg", lambda route: pending.append(route))
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/art-1.jpg", "Old track"))
-    page.wait_for_function("document.querySelector('#artwork').getAttribute('src') === '/art-1.jpg'")
+    page.route(f"**{ART_ONE}", lambda route: pending.append(route))
+    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, ART_ONE, "Old track"))
+    page.wait_for_function("path => document.querySelector('#artwork').getAttribute('src') === path", arg=ART_ONE)
     assert pending
     page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/demo.svg", "New track"))
     expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/demo.svg")
@@ -236,6 +238,17 @@ def test_late_artwork_cannot_replace_a_newer_track(bridge_page, bridge):
     expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/demo.svg")
     expect(page.locator("#artwork")).to_have_attribute("src", "/demo.svg")
     expect(page.locator("#title")).to_have_text("New track")
+
+
+@pytest.mark.parametrize('artwork', [
+    '/art-1.jpg', '/art-' + 'z' * 64 + '.jpg', '/art-' + '1' * 64 + '.jpg/extra',
+    'https://example.invalid/art-' + '1' * 64 + '.jpg',
+])
+def test_artwork_validation_rejects_nonlocal_or_malformed_content_ids(bridge_page, bridge, artwork):
+    page = bridge_page
+    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, artwork))
+    expect(page.locator('#artwork')).to_have_attribute('src', '/placeholder.svg')
+    expect(page.locator('.ambience img.visible')).to_have_attribute('src', '/placeholder.svg')
 
 
 @pytest.mark.parametrize("width,height", [(868, 695), (390, 640), (868, 500)])
