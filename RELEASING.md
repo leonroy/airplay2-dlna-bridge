@@ -88,6 +88,11 @@ Production Compose pulls the image selected by `BRIDGE_IMAGE_TAG` (default
 `docker compose up -d bridge`. For rollback, select an earlier published version
 and repeat those commands. `v0.1.0` has no published image.
 
+A bridge image update does not replace the deployment files on the Docker host.
+For receiver configuration changes, follow the [configuration migration](README.md#compose-settings)
+and update those files separately. Receiver mode and name use `AIRPLAY_VERSION`
+and `AIRPLAY_NAME` in `.env`.
+
 Preserve existing fixed PCM settings and reconnect AirPlay after replacing the
 bridge. See [PCM output format](README.md#pcm-output-format) for metadata
 requirements and automatic-selection limits.

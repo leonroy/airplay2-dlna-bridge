@@ -39,7 +39,7 @@ Edit `.env` before starting the containers:
 
 - Set `HOST_IP` to the Docker host's LAN address. The speaker fetches audio from this address.
 - Set `RENDERER_IP` to the speaker's LAN address.
-- Set `MAX_VOLUME` to the maximum speaker volume that you want the sender to control.
+- Optionally uncomment `MAX_VOLUME` and set the maximum speaker volume that you want the sender to control.
 
 Start the containers:
 
@@ -97,17 +97,34 @@ The main settings are:
 | --- | --- | --- |
 | `HOST_IP` | Set for your network | Docker host address reachable by the speaker. |
 | `RENDERER_IP` | Set for your network | Speaker address. Leave empty to disable automatic playback and volume control. |
+| `AIRPLAY_VERSION` | `2` | Receiver mode: `1` for classic AirPlay or `2` for AirPlay 2. |
+| `AIRPLAY_NAME` | `AirPlay 1 Bridge` or `AirPlay 2 Bridge` | Name shown in the sender's AirPlay menu, according to the selected version. |
 | `MAX_VOLUME` | `100` | Speaker volume when the sender is at full volume, on a 0–100 scale. |
 | `DIDL_PUSH` | `1` | Refresh track information on the speaker display. See [Playback behavior](#playback-behavior). |
 | `STREAM_PORT` | `8000` | Host port for audio, artwork, and the status page. |
 | `BRIDGE_IMAGE_TAG` | `latest` | Published bridge version. Release tags omit the leading `v`. |
-| `SHAIRPORT_COMMAND` | `-c /etc/shairport-sync.conf` | Receiver arguments. Set the classic command below for AirPlay 1. |
 
 Apply `.env` changes with `docker compose up -d` on the Docker host.
-To rename the AirPlay endpoint, edit `general.name` in `shairport-sync.conf`,
-then run `docker compose restart shairport-sync`.
-For AirPlay 1, change the name after `-a` in `SHAIRPORT_COMMAND` instead,
-then run `docker compose up -d shairport-sync`.
+To rename the AirPlay endpoint, set `AIRPLAY_NAME="Living Room"` in `.env`.
+The receiver mode and name come from `.env` for both AirPlay versions.
+
+Keep the supplied `shairport-sync.conf` for ordinary installations.
+It contains only bridge-specific settings: pipe output, shared audio and metadata
+paths, automatic audio rate and format selection, and speaker volume handling.
+Shairport supplies stereo output, enabled metadata and artwork, the session
+timeout, and normal logging from its [defaults](https://github.com/mikebrady/shairport-sync/blob/master/scripts/shairport-sync.conf).
+The receiver image also provides
+the standard configuration path and receiver ports.
+
+If upgrading from `SHAIRPORT_COMMAND`, remove that line from `.env`.
+For a classic receiver, replace it with `AIRPLAY_VERSION=1`.
+Move any custom name from the old command or `general.name` to `AIRPLAY_NAME`.
+Retain your `STREAM_PORT`.
+Download the updated Compose and Shairport configuration files before running
+`docker compose up -d`. The old command variable is no longer used.
+Preserve any custom fixed PCM settings in the updated configuration file.
+If you used `docker-compose.airplay1.yml`, switch to the main Compose file with
+`AIRPLAY_VERSION=1` in `.env`.
 
 Speaker control uses the fixed UPnP description port `49152`.
 Seek and pause do not force audio connections to close.
@@ -130,11 +147,11 @@ format metadata. See [RELEASING.md](RELEASING.md) for image publishing and relea
 ### Separate AirPlay 1 and AirPlay 2 endpoints
 
 For an additional classic AirPlay 1 endpoint, use a separate deployment folder and `.env`.
-Set the host and speaker addresses there, and set `STREAM_PORT=8001`.
-Add this line to the AirPlay 1 `.env`:
+Set the host and speaker addresses there. Add these lines to the AirPlay 1 `.env`:
 
 ```dotenv
-SHAIRPORT_COMMAND=--service-type=classic -a "AirPlay 1 Bridge" -p 5000 -c /etc/shairport-sync.conf
+AIRPLAY_VERSION=1
+STREAM_PORT=8001
 ```
 
 Keep the AirPlay 2 deployment on port `8000`.
@@ -150,6 +167,8 @@ docker compose up -d
 
 The AirPlay 1 endpoint advertises “AirPlay 1 Bridge” on RTSP port `5000`.
 The ordinary AirPlay 2 endpoint uses RTSP port `7000`.
+Shairport chooses these receiver ports from the selected mode. They are separate
+from `STREAM_PORT`, which serves audio and the web page.
 Each deployment has separate containers and an audio volume.
 If both target one speaker, select one endpoint at a time. The bridge processes
 do not coordinate speaker ownership.
@@ -166,9 +185,10 @@ If the speaker cannot fetch audio, make sure that it can reach `HOST_IP` on
 `STREAM_PORT`. Use `/stream.flac` for playback or `/stream.wav` for diagnostic audio.
 An HTTP 503 response means that audio is not ready or a connection or encoder limit is reached.
 
-If the page waits for an audio format, keep `metadata.enabled = "yes"` and the
-shared metadata pipe configured in `shairport-sync.conf`. Logs identify incoming
-format as `sdsc` and pipe output format as `odsc`, with session IDs, byte counts,
+If the page waits for an audio format, make sure that the shared metadata pipe
+is configured in `shairport-sync.conf`. Metadata is enabled by default in the
+supplied receiver image. If you disabled it, remove that override.
+Logs identify incoming format as `sdsc` and pipe output format as `odsc`, with session IDs, byte counts,
 and rejection reasons.
 
 For startup delays, inspect the `timing` records for `playback_ready`,
@@ -191,7 +211,6 @@ To use fixed 24-bit/48 kHz stereo output, set these values in the `pipe` block o
 ```conf
 output_rate = 48000;
 output_format = "S24_3LE";
-output_channels = 2;
 ```
 
 The bridge accepts ten integer sample formats, including big-endian and padded
