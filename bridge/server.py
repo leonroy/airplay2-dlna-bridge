@@ -1037,15 +1037,30 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def icy_block(last):
-        cur = (NOW_PLAYING["title"], NOW_PLAYING["artist"], NOW_PLAYING["artwork"])
-        if not cur[0] or cur == last:
+        with AUDIO.lock:
+            cur = (NOW_PLAYING["title"], NOW_PLAYING["artist"], NOW_PLAYING["artwork"])
+        if cur == last or (not cur[0] and last is None):
             return b"\x00", last
         title, artist, art = cur
-        song = f"{artist} - {title}" if artist else title
-        s = f"StreamTitle='{song}';"
+        song = f"{artist} - {title}" if title and artist else title
+
+        def field(value):
+            # ICY readers disagree about backslash escapes. Keep delimiters out
+            # of values instead, and replace controls without joining words.
+            return "".join(" " if ord(char) < 32 or 127 <= ord(char) <= 159
+                           else "’" if char == "'" else "/" if char == "\\" else char
+                           for char in value)
+
+        prefix, suffix = b"StreamTitle='", b"';"
+        limit = 255 * 16
+        raw_song = field(song).encode("utf-8")
+        raw_song = raw_song[:limit - len(prefix) - len(suffix)].decode("utf-8", errors="ignore").encode("utf-8")
+        raw = prefix + raw_song + suffix
         if art:
-            s += f"StreamUrl='{art}';"
-        raw = s.encode("utf-8")
+            artwork = f"StreamUrl='{field(art)}';".encode("utf-8")
+            # Never truncate the URL into an unusable address.
+            if len(raw) + len(artwork) <= limit:
+                raw += artwork
         pad = (-len(raw)) % 16
         return bytes([(len(raw) + pad) // 16]) + raw + b"\x00" * pad, cur
 
@@ -1619,22 +1634,23 @@ def handle_copl(data):
 def _handle_copl_locked(data):
     """AirPlay 2 sends now-playing info as 'copl' items: a binary plist with
     kMRMediaRemoteNowPlayingInfo* keys (title/artist/album/artwork). Frequent
-    partial updates (elapsed time only) carry no title and are ignored."""
+    partial updates change only the fields that they include."""
     try:
         pl = plistlib.loads(data)
     except Exception:
         return
-    title = artist = album = art = mime = None
+    fields = {}
+    art = mime = None
     for d in _walk_dicts(pl):
         for k, v in d.items():
             if not isinstance(k, str):
                 continue
             if k.endswith("NowPlayingInfoTitle"):
-                title = metadata_text(v)
+                fields["title"] = metadata_text(v)
             elif k.endswith("NowPlayingInfoArtist"):
-                artist = metadata_text(v)
+                fields["artist"] = metadata_text(v)
             elif k.endswith("NowPlayingInfoAlbum"):
-                album = metadata_text(v)
+                fields["album"] = metadata_text(v)
             elif k.endswith("NowPlayingInfoArtworkData"):
                 art = v
             elif k.endswith("NowPlayingInfoArtworkMIMEType"):
@@ -1642,13 +1658,41 @@ def _handle_copl_locked(data):
 
     update_artwork(art, mime)
 
-    if isinstance(title, str) and title and (
-            title != NOW_PLAYING["title"] or (artist or "") != NOW_PLAYING["artist"]):
-        NOW_PLAYING["title"] = title
-        NOW_PLAYING["artist"] = artist if isinstance(artist, str) else ""
-        NOW_PLAYING["album"] = album if isinstance(album, str) else ""
+    update_track_fields(fields)
+
+
+def update_track_fields(fields):
+    """Merge valid fields under AUDIO.lock, including explicit empty values."""
+    changed = {}
+    for key, candidate in fields.items():
+        if key not in ("title", "artist", "album"):
+            continue
+        value = metadata_text(candidate)
+        if value is not None and value != NOW_PLAYING[key]:
+            changed[key] = value
+    if changed:
+        NOW_PLAYING.update(changed)
         mark_metadata_dirty()
         log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
+
+
+def handle_classic_metadata(typ, code, data, pending):
+    """Start with empty pending fields and publish only the completed update."""
+    if typ == "ssnc" and code == "mdst":
+        pending.clear()
+    elif typ == "core" and code in ("minm", "asar", "asal"):
+        value = metadata_text(data.decode("utf-8", errors="replace"))
+        if value is not None:
+            pending[code] = value
+    elif typ == "ssnc" and code == "mden":
+        with AUDIO.lock:
+            update_track_fields({field: pending[code]
+                                 for code, field in (("minm", "title"), ("asar", "artist"), ("asal", "album"))
+                                 if code in pending})
+            pending.clear()
+    else:
+        return False
+    return True
 
 
 ITEM = re.compile(
@@ -1825,12 +1869,10 @@ def metadata_reader(wiim):
 
                         if typ == "ssnc" and handle_playback_metadata(code, data, wiim, pending):
                             continue
+                        if handle_classic_metadata(typ, code, data, pending):
+                            continue
                         if typ == "ssnc" and code == "copl" and data:
                             handle_copl(data)
-                        elif typ == "core" and code in ("minm", "asar", "asal"):
-                            value = metadata_text(data.decode("utf-8", errors="replace"))
-                            if value is not None:
-                                pending[code] = value
                         elif typ == "ssnc" and code == "pvol":
                             # "airplay_volume,attenuation,low,high"; airplay_volume
                             # is -30..0 dB, -144 = mute -> renderer hardware volume
@@ -1842,20 +1884,13 @@ def metadata_reader(wiim):
                                 pass
                         elif typ == "ssnc" and code == "PICT" and data:
                             update_artwork(data)
-                        elif typ == "ssnc" and code == "mden":
-                            with AUDIO.lock:
-                                if pending.get("minm") and (
-                                        pending.get("minm") != NOW_PLAYING["title"] or
-                                        pending.get("asar", "") != NOW_PLAYING["artist"]):
-                                    NOW_PLAYING["title"] = pending.get("minm", "")
-                                    NOW_PLAYING["artist"] = pending.get("asar", "")
-                                    NOW_PLAYING["album"] = pending.get("asal", "")
-                                    mark_metadata_dirty()
-                                    log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
             log(f"metadata pipe EOF unparsed_bytes={len(parser.buffer)} last_event_seq={sequence}; {AUDIO.status()}")
             with AUDIO.lock:
                 session_id, was_active = AUDIO.session_id, STATE["active"]
                 AUDIO.end("metadata pipe EOF")
+                pending.clear()
+                NOW_PLAYING.update(title="", artist="", album="", artwork="")
+                ART.update(id=None, bytes=b"")
                 STATE.update(active=False, dirty=0.0, pushed=None)
                 if was_active:
                     wiim.stop(session_id)
@@ -1864,6 +1899,9 @@ def metadata_reader(wiim):
             log(f"metadata pipe error: {e}; last_event_seq={sequence}; {AUDIO.status()}")
             with AUDIO.lock:
                 AUDIO.fail("metadata pipe lost")
+                pending.clear()
+                NOW_PLAYING.update(title="", artist="", album="", artwork="")
+                ART.update(id=None, bytes=b"")
                 STATE.update(active=False, dirty=0.0, pushed=None)
                 wiim.stop(AUDIO.session_id)
             drop_clients("metadata pipe lost")
