@@ -480,17 +480,25 @@ def cache_art(art_id, data, mime):
     return True
 
 
+def artwork_content_type(data):
+    """Use image signatures instead of untrusted metadata for HTTP headers."""
+    if not isinstance(data, bytes) or not data:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return None
+
+
 def update_artwork(data, mime=None):
-    """Publish artwork from either metadata protocol under the audio lock."""
+    """Publish supported artwork from either metadata protocol under the audio lock."""
     if not isinstance(data, bytes) or not data or len(data) > ART_ITEM_MAX:
         return False
+    mime = artwork_content_type(data)
+    if mime is None:
+        return False
     art_id = hashlib.sha256(data).hexdigest()
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        mime = "image/png"
-    elif data.startswith(b"\xff\xd8\xff"):
-        mime = "image/jpeg"
-    elif not isinstance(mime, str) or not mime:
-        mime = "image/jpeg"
     with AUDIO.lock:
         if ART["id"] == art_id and ART["bytes"] == data:
             return False
@@ -864,8 +872,9 @@ class StreamHandler(BaseHTTPRequestHandler):
         if entry is None:
             self.send_error(404)
             return
-        data, mime = entry
-        if not data:
+        data, _declared_mime = entry
+        mime = artwork_content_type(data)
+        if mime is None:
             self.send_error(404)
             return
         self.send_response(200)

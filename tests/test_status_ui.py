@@ -89,20 +89,20 @@ def test_status_tracks_real_session_without_network_or_encoder(bridge, monkeypat
 
 def test_status_artwork_is_local_and_empty_when_session_ends(bridge):
     bridge.AUDIO.begin()
-    bridge.update_artwork(b'sample')
+    bridge.update_artwork(b'\x89PNG\r\n\x1a\nsample')
     bridge.NOW_PLAYING['artwork'] = 'http://example.invalid/private.jpg'
-    assert bridge.status_snapshot()['track']['artwork'] == f"/art-{hashlib.sha256(b'sample').hexdigest()}.jpg"
+    assert bridge.status_snapshot()['track']['artwork'] == f"/art-{hashlib.sha256(b'\x89PNG\r\n\x1a\nsample').hexdigest()}.jpg"
     bridge.AUDIO.end(drain=False)
     assert bridge.status_snapshot()['track']['artwork'] is None
 
 
 def test_cached_artwork_urls_return_their_own_image_and_mime(http_server, bridge):
-    older, current = hashlib.sha256(b'older cover').hexdigest(), hashlib.sha256(b'current cover').hexdigest()
-    bridge.cache_art(older, b'older cover', 'image/png')
-    bridge.cache_art(current, b'current cover', 'image/jpeg')
-    bridge.ART.update(id=current, bytes=b'current cover', mime='image/jpeg')
-    for art_id, image, mime in [(older, b'older cover', 'image/png'),
-                                (current, b'current cover', 'image/jpeg')]:
+    older, current = hashlib.sha256(b'\x89PNG\r\n\x1a\nolder cover').hexdigest(), hashlib.sha256(b'\xff\xd8\xffcurrent cover').hexdigest()
+    bridge.cache_art(older, b'\x89PNG\r\n\x1a\nolder cover', 'image/png')
+    bridge.cache_art(current, b'\xff\xd8\xffcurrent cover', 'image/jpeg')
+    bridge.ART.update(id=current, bytes=b'\xff\xd8\xffcurrent cover', mime='image/jpeg')
+    for art_id, image, mime in [(older, b'\x89PNG\r\n\x1a\nolder cover', 'image/png'),
+                                (current, b'\xff\xd8\xffcurrent cover', 'image/jpeg')]:
         connection, response = http_server(f'/art-{art_id}.jpg')
         assert response.status == 200
         assert response.getheader('Content-Type') == mime
@@ -112,17 +112,17 @@ def test_cached_artwork_urls_return_their_own_image_and_mime(http_server, bridge
 
 
 def test_evicted_artwork_url_does_not_return_current_cover(http_server, bridge):
-    bridge.update_artwork(b'evicted cover')
+    bridge.update_artwork(b'\x89PNG\r\n\x1a\nevicted cover')
     expired = bridge.NOW_PLAYING['artwork']
     expired_id = bridge.ART['id']
     for index in range(bridge.ART_CACHE_MAX):
-        bridge.update_artwork(f'current cover {index}'.encode())
+        bridge.update_artwork(b'\x89PNG\r\n\x1a\n' + f'current cover {index}'.encode())
     assert expired_id not in bridge.ART_CACHE
     assert bridge.ART['id'] in bridge.ART_CACHE
     assert len(bridge.ART_CACHE) == bridge.ART_CACHE_MAX
     connection, response = http_server(expired)
     assert response.status == 404
-    assert b'current cover' not in response.read()
+    assert b'\xff\xd8\xffcurrent cover' not in response.read()
     connection.close()
 
 
@@ -141,38 +141,38 @@ def test_previous_instance_artwork_url_does_not_return_new_cover(http_server, br
         module.handle_copl(plistlib.dumps({'kMRMediaRemoteNowPlayingInfoArtworkData': data}))
 
     old, new = load(1000), load(1001)
-    ingest(old, b'first old cover')
-    ingest(old, b'previous instance cover')
-    ingest(new, b'new instance cover')
+    ingest(old, b'\x89PNG\r\n\x1a\nfirst old cover')
+    ingest(old, b'\x89PNG\r\n\x1a\nprevious instance cover')
+    ingest(new, b'\x89PNG\r\n\x1a\nnew instance cover')
     old_id, new_id = old.ART['id'], new.ART['id']
     assert old_id != new_id
     # The existing test server now serves the new instance's real artwork cache.
     monkeypatch.setattr(bridge, 'ART_CACHE', new.ART_CACHE)
     connection, response = http_server(f'/art-{old_id}.jpg')
     assert response.status == 404
-    assert b'new instance cover' not in response.read()
+    assert b'\x89PNG\r\n\x1a\nnew instance cover' not in response.read()
     connection.close()
     connection, response = http_server(f'/art-{new_id}.jpg')
     assert response.status == 200
-    assert response.read() == b'new instance cover'
+    assert response.read() == b'\x89PNG\r\n\x1a\nnew instance cover'
     connection.close()
-    ingest(new, b'previous instance cover')
+    ingest(new, b'\x89PNG\r\n\x1a\nprevious instance cover')
     assert new.ART['id'] == old_id
     connection, response = http_server(f'/art-{old_id}.jpg')
     assert response.status == 200
-    assert response.read() == b'previous instance cover'
+    assert response.read() == b'\x89PNG\r\n\x1a\nprevious instance cover'
     connection.close()
 
 
 @pytest.mark.parametrize('path', [
     '/art-' + 'f' * 64 + '.jpg', '/art-invalid.jpg', '/art-100.jpg',
-    '/art-' + hashlib.sha256(b'current cover').hexdigest() + '.jpg/extra',
+    '/art-' + hashlib.sha256(b'\xff\xd8\xffcurrent cover').hexdigest() + '.jpg/extra',
 ])
 def test_unknown_artwork_urls_do_not_return_current_cover(http_server, bridge, path):
-    bridge.update_artwork(b'current cover')
+    bridge.update_artwork(b'\xff\xd8\xffcurrent cover')
     connection, response = http_server(path)
     assert response.status == 404
-    assert b'current cover' not in response.read()
+    assert b'\xff\xd8\xffcurrent cover' not in response.read()
     connection.close()
 
 
@@ -222,17 +222,17 @@ def test_ingested_artwork_has_its_own_mime_over_http(http_server, bridge, monkey
 
 
 def test_duplicate_artwork_does_not_dirty_metadata_and_reused_cover_stays_cached(bridge):
-    bridge.update_artwork(b'reused cover')
+    bridge.update_artwork(b'\x89PNG\r\n\x1a\nreused cover')
     revision, first_id = bridge.STATE['revision'], bridge.ART['id']
-    assert not bridge.update_artwork(b'reused cover')
+    assert not bridge.update_artwork(b'\x89PNG\r\n\x1a\nreused cover')
     assert bridge.STATE['revision'] == revision
-    bridge.update_artwork(b'other cover')
-    bridge.update_artwork(b'reused cover')
+    bridge.update_artwork(b'\x89PNG\r\n\x1a\nother cover')
+    bridge.update_artwork(b'\x89PNG\r\n\x1a\nreused cover')
     assert bridge.ART['id'] == first_id
     for index in range(bridge.ART_CACHE_MAX - 1):
-        bridge.update_artwork(f'next cover {index}'.encode())
+        bridge.update_artwork(b'\x89PNG\r\n\x1a\n' + f'next cover {index}'.encode())
     assert first_id in bridge.ART_CACHE
-    assert hashlib.sha256(b'other cover').hexdigest() not in bridge.ART_CACHE
+    assert hashlib.sha256(b'\x89PNG\r\n\x1a\nother cover').hexdigest() not in bridge.ART_CACHE
 
 
 def test_log_history_bounds_bytes_entries_and_reports_gap(bridge):

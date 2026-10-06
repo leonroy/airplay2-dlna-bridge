@@ -82,7 +82,7 @@ def test_titleless_start_keeps_existing_fallback(bridge, startup):
     renderer, event, metadata, step = startup
     event("pbeg")
     event("odsc", b"44100/S16_LE/2")
-    metadata(artwork=b"cover", at=100.25)
+    metadata(artwork=b"\x89PNG\r\n\x1a\ncover", at=100.25)
     assert not step(102.24)
     assert step(102.25)
     assert step(102.3)
@@ -96,7 +96,7 @@ def test_title_and_art_inside_quiet_period_coalesce_one_uri(bridge, startup):
     event("odsc", b"44100/S16_LE/2")
     metadata("Early title", at=100.1)
     metadata("Final title", at=100.4)
-    metadata(artwork=b"late cover", at=100.7)
+    metadata(artwork=b"\x89PNG\r\n\x1a\nlate cover", at=100.7)
     assert not step(101.19)
     assert step(101.2)
     assert step(101.25)
@@ -111,8 +111,8 @@ def test_identical_metadata_does_not_postpone_start(bridge, startup):
     renderer, event, metadata, step = startup
     event("pbeg")
     event("odsc", b"44100/S16_LE/2")
-    metadata("Title", artwork=b"cover", at=100.1)
-    metadata("Title", artwork=b"cover", at=100.4)
+    metadata("Title", artwork=b"\x89PNG\r\n\x1a\ncover", at=100.1)
+    metadata("Title", artwork=b"\x89PNG\r\n\x1a\ncover", at=100.4)
     assert step(100.61)
     assert step(100.66)
     assert names(renderer) == ["SetAVTransportURI", "Play"]
@@ -127,7 +127,7 @@ def test_late_art_after_success_keeps_mid_play_debounce(bridge, startup, monkeyp
     metadata("Title", at=100.1)
     assert step(100.61)
     assert step(100.66)
-    metadata(artwork=b"late cover", at=100.8)
+    metadata(artwork=b"\x89PNG\r\n\x1a\nlate cover", at=100.8)
     assert not step(101.3)
     assert step(102.8) is didl
     assert step(102.85) is didl
@@ -167,7 +167,7 @@ def test_update_during_uri_cancels_stale_play_and_coalesces_retry(bridge, startu
     worker.start()
     try:
         assert entered.wait(1)
-        metadata(artwork=b"cover", at=100.7)
+        metadata(artwork=b"\x89PNG\r\n\x1a\ncover", at=100.7)
     finally:
         release.set()
         worker.join(2)
