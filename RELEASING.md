@@ -30,10 +30,34 @@ Tags point directly at tested commits; the bot never commits or pushes main.
 Direct pushes do not receive a separate release. If a PR title is invalid,
 the backlog stops with an error; correct the title and rerun the workflow.
 
-Only the fork's release job has `contents: write`, `packages: write`, and `pull-requests: read`,
-using `GITHUB_TOKEN`. Python Semantic Release creates tags with an explicit bump
+Python Semantic Release creates tags with an explicit bump
 derived from the PR; GitHub CLI creates releases without updating existing notes.
-No personal token or PyPI publishing is required. Server deployment is a separate action.
+No PyPI publishing is required. Server deployment is a separate action.
+
+## Release authentication
+
+The release workflow uses two tokens:
+
+- `RELEASE_TOKEN` authenticates tag pushes, GitHub releases, changelog uploads,
+  and merged PR queries. The release step passes this repository Actions secret
+  as `GH_TOKEN`, which GitHub CLI and Python Semantic Release read.
+- `GITHUB_TOKEN` authenticates Docker login to GHCR for image publishing.
+  GitHub creates this token for each job. It requires no stored secret or renewal.
+
+Create a fine-grained personal access token limited to this repository with
+Contents write, Workflows write, and Pull requests read permissions. Store it
+under Settings → Secrets and variables → Actions as `RELEASE_TOKEN`.
+Choose an expiration that fits your maintenance needs; no expiration is allowed
+unless an account or organization policy requires one. If the token expires,
+replace it and update the repository secret before rerunning the Release workflow.
+
+Workflows write permission allows tagging older commits whose workflow files
+differ from `main`. The built-in `GITHUB_TOKEN` cannot receive this permission
+through the workflow's `permissions` block.
+
+The release job grants `GITHUB_TOKEN` `contents: write`, `packages: write`, and
+`pull-requests: read`. These job permissions do not grant or change the separate
+permissions of `RELEASE_TOKEN`. Neither token is passed to the deployed containers.
 
 ## Docker images
 

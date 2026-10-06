@@ -93,4 +93,4 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
-          STREAM_PORT=8001 docker compose -p airplay1-dlna-bridge -f docker-compose.yml -f docker-compose.airplay1.yml config --quiet
+          STREAM_PORT=8001 SHAIRPORT_COMMAND='--service-type=classic -a "AirPlay 1 Bridge" -p 5000 -c /etc/shairport-sync.conf' docker compose -p airplay1-dlna-bridge config --quiet

@@ -92,6 +92,52 @@ def test_status_artwork_is_local_and_empty_when_session_ends(bridge):
     assert bridge.status_snapshot()['track']['artwork'] is None
 
 
+def test_cached_artwork_urls_return_their_own_image_and_mime(http_server, bridge):
+    bridge.cache_art(100, b'older cover', 'image/png')
+    bridge.cache_art(101, b'current cover', 'image/jpeg')
+    bridge.ART.update(id=101, bytes=b'current cover', mime='image/jpeg')
+    for art_id, image, mime in [(100, b'older cover', 'image/png'),
+                                (101, b'current cover', 'image/jpeg')]:
+        connection, response = http_server(f'/art-{art_id}.jpg')
+        assert response.status == 200
+        assert response.getheader('Content-Type') == mime
+        assert int(response.getheader('Content-Length')) == len(image)
+        assert response.read() == image
+        connection.close()
+
+
+def test_evicted_artwork_url_does_not_return_current_cover(http_server, bridge):
+    bridge.cache_art(100, b'evicted cover', 'image/jpeg')
+    for art_id in range(101, 101 + bridge.ART_CACHE_MAX):
+        bridge.cache_art(art_id, b'current cover', 'image/jpeg')
+    bridge.ART.update(id=100 + bridge.ART_CACHE_MAX, bytes=b'current cover', mime='image/jpeg')
+    assert 100 not in bridge.ART_CACHE
+    connection, response = http_server('/art-100.jpg')
+    assert response.status == 404
+    assert b'current cover' not in response.read()
+    connection.close()
+
+
+def test_previous_instance_artwork_url_does_not_return_new_cover(http_server, bridge):
+    # A fresh bridge starts without the previous instance's artwork history.
+    bridge.ART.update(id=200, bytes=b'new instance cover', mime='image/jpeg')
+    bridge.cache_art(200, bridge.ART['bytes'], bridge.ART['mime'])
+    connection, response = http_server('/art-100.jpg')
+    assert response.status == 404
+    assert b'new instance cover' not in response.read()
+    connection.close()
+
+
+@pytest.mark.parametrize('path', ['/art-999.jpg', '/art-invalid.jpg'])
+def test_unknown_artwork_urls_do_not_return_current_cover(http_server, bridge, path):
+    bridge.ART.update(id=100, bytes=b'current cover', mime='image/jpeg')
+    bridge.cache_art(100, bridge.ART['bytes'], bridge.ART['mime'])
+    connection, response = http_server(path)
+    assert response.status == 404
+    assert b'current cover' not in response.read()
+    connection.close()
+
+
 def test_log_history_bounds_bytes_entries_and_reports_gap(bridge):
     history = bridge.LogHistory(max_entries=3, max_bytes=10)
     for line in ['aaaa', 'bbbb', 'cccc', 'dddd']:
@@ -344,8 +390,9 @@ def test_observer_never_follows_description_to_another_device(bridge, monkeypatc
     assert request.call_count == 1
 
 
-def test_alternate_recipient_port_applies_to_commands_and_observations(bridge, monkeypatch):
-    monkeypatch.setattr(bridge, 'RENDERER_PORT', 8080)
+def test_fixed_recipient_port_applies_to_commands_and_observations(monkeypatch, request):
+    monkeypatch.setenv('RENDERER_PORT', '8080')
+    bridge = request.getfixturevalue('bridge')
     calls = []
 
     def request(url, **kwargs):
@@ -356,10 +403,10 @@ def test_alternate_recipient_port_applies_to_commands_and_observations(bridge, m
 
     monkeypatch.setattr(bridge, 'http_req', request)
     renderer = bridge.Renderer('192.0.2.10')
-    assert renderer.resolve('AVTransport', time.monotonic() + 2) == 'http://192.0.2.10:8080/control'
+    assert renderer.resolve('AVTransport', time.monotonic() + 2) == 'http://192.0.2.10:49152/control'
     instance = bridge.RecipientObserver('192.0.2.10')
     assert instance.read('GetTransportInfo', '', 'AVTransport', 'CurrentTransportState', time.monotonic() + 2) == 'STOPPED'
-    assert all(url.startswith('http://192.0.2.10:8080/') for url in calls)
+    assert all(url.startswith('http://192.0.2.10:49152/') for url in calls)
 
 
 def test_observer_sleeps_without_viewers_and_shares_work_across_viewers(bridge):

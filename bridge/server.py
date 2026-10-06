@@ -20,9 +20,7 @@ META_PIPE = "/shared/metadata"
 PORT = int(os.environ.get("STREAM_PORT", "8000"))
 STREAM_URL = os.environ.get("STREAM_URL", "")
 RENDERER_IP = os.environ.get("RENDERER_IP") or os.environ.get("WIIM_IP", "")
-RENDERER_PORT = int(os.environ.get("RENDERER_PORT", "49152"))
-if not 1 <= RENDERER_PORT <= 65535:
-    raise ValueError("RENDERER_PORT must be between 1 and 65535")
+RENDERER_PORT = 49152
 MAX_VOLUME = int(os.environ.get("MAX_VOLUME", "100"))
 HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", "16"))
 FLAC_MAX_ENCODERS = int(os.environ.get("FLAC_MAX_ENCODERS", "4"))
@@ -474,9 +472,6 @@ def cache_art(art_id, data, mime):
 # WiiM's display only reads DIDL (it ignores ICY), so a track change needs a
 # SetAVTransportURI push; the player restarts the stream on it (~2-4s gap).
 DIDL_PUSH = os.environ.get("DIDL_PUSH", "1") == "1"
-# on seek/pause, drop stream clients so the player discards its buffered stale
-# audio and reconnects at the new position (faster reaction to phone actions)
-FLUSH_RESYNC = os.environ.get("FLUSH_RESYNC", "1") == "1"
 PUSH_SETTLE = 2.0
 INITIAL_PUSH_SETTLE = 0.5           # initial playback with a real title
 STATE = {"active": False, "dirty": 0.0, "pushed": None, "revision": 0}
@@ -832,7 +827,11 @@ class StreamHandler(BaseHTTPRequestHandler):
     def serve_art(self):
         m = re.search(r"/art-(\d+)", self.path)
         entry = ART_CACHE.get(int(m.group(1))) if m else None
-        data, mime = entry if entry else (ART["bytes"], ART["mime"])
+        # An expired URL must never serve a different track's current cover.
+        if entry is None:
+            self.send_error(404)
+            return
+        data, mime = entry
         if not data:
             self.send_error(404)
             return
@@ -1719,10 +1718,6 @@ def metadata_reader(wiim):
                                     NOW_PLAYING["album"] = pending.get("asal", "")
                                     mark_metadata_dirty()
                                     log(f"now playing: {NOW_PLAYING['artist']} - {NOW_PLAYING['title']}")
-                        elif typ == "ssnc" and code in ("pfls", "paus") and FLUSH_RESYNC:
-                            # seek/pause: make the player discard stale buffered
-                            # audio so it reacts at the new position promptly
-                            drop_clients("seek/pause" if code == "pfls" else "pause")
                     # a partial cover-art item can be ~700KB of base64: keep enough tail
                     buf = buf[pos:] if pos else buf[-2097152:]
             log(f"metadata pipe EOF unparsed_bytes={len(buf)} last_event_seq={sequence}; {AUDIO.status()}")
