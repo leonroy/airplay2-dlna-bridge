@@ -241,6 +241,16 @@ With `HTTP_MAX_CONNECTIONS=1`, live status connections are disabled.
 Log history holds up to 500 entries or 512 KiB, with a 4 KiB limit per message.
 Expired entries are skipped, and history resets when the bridge restarts.
 
+Metadata has fixed memory limits. Each item accepts up to 8 MiB of decoded data
+and 12 MiB of raw input, including XML and base64 text. Each track field accepts
+up to 4 KiB of UTF-8 text. Each cover accepts up to 4 MiB. The artwork cache holds
+up to 16 covers or 16 MiB, whichever limit it reaches first.
+
+The reader discards invalid items and resumes at the next item. It rejects
+invalid base64, mismatched declared lengths and values above these limits.
+The reader skips rejected items without ending an active audio session.
+Valid items can span pipe reads.
+
 ### Initial playback timing
 
 With a track title available, initial playback waits for 0.5 seconds without a
