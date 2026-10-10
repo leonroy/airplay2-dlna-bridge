@@ -87,6 +87,18 @@ def test_status_tracks_real_session_without_network_or_encoder(bridge, monkeypat
     assert bridge.status_snapshot()['audio']['state'] == 'idle'
 
 
+@pytest.mark.parametrize("sample_format,bits", [("S8", 16), ("S16_LE", 16), ("S24_LE", 24), ("S32_LE", 32)])
+def test_output_stream_describes_flac_encoder_and_clears_at_end(bridge, sample_format, bits):
+    assert bridge.status_snapshot()["audio"]["output_stream"] is None
+    bridge.AUDIO.describe(f"48000/{sample_format}/2")
+    audio = bridge.status_snapshot()["audio"]
+    assert audio["output_stream"] == dict(codec="FLAC", rate=48000, bits=bits, channels=2)
+    command = bridge.AUDIO.pcm.encoder_command()
+    assert int(command[command.index("-bits_per_raw_sample") + 1]) == bits
+    bridge.AUDIO.end(drain=False)
+    assert bridge.status_snapshot()["audio"]["output_stream"] is None
+
+
 def test_status_artwork_is_local_and_empty_when_session_ends(bridge):
     bridge.AUDIO.begin()
     bridge.update_artwork(b'\x89PNG\r\n\x1a\nsample')

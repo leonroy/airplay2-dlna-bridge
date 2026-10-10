@@ -34,6 +34,18 @@ h1 { font-size: clamp(25px, 5vw, 32px); line-height: 1.15; font-weight: 600; let
 .status[data-state="receiving"] .dot { background: #a0c6ab; }
 .status[data-state="error"] .dot, .status[data-state="waiting"] .dot { background: #dfb386; }
 .format, .volume { font-size: 10px; color: #fff6; margin: 8px 0 0; letter-spacing: .035em; }
+.volume { margin-top: 18px; }
+.audio-formats { width: max-content; margin: 18px auto 0; text-align: left; }
+.format { display: grid; grid-template-columns: 61px 35px 4px 29px 4px 46px 4px 58px; gap: 6px; align-items: center; white-space: nowrap; font-size: 11px; color: #e5e1de; margin: 0; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.format:empty { display: none; }
+.format + .format:not(:empty) { margin-top: 13px; }
+.format-label { color: #ffffffa0; }
+.format-codec { font-weight: 600; }
+.format-separator { color: #ffffff70; text-align: center; }
+.format-unknown { grid-column: 2 / -1; }
+.channel-badge { text-align: center; border: 1px solid #ffffff25; border-radius: 4px; padding: 0 3px; color: #e4e2df; }
+.channel-badge.incoming { background: #edcbb008; border-color: #edcbb040; color: #edcbb0; }
+@media (max-width: 360px) { .format { grid-template-columns: 51px 29px 3px 26px 3px 39px 3px 49px; gap: 4px; font-size: 10px; } }
 .issue { margin: 18px 0 0; background: #ffffff07; border: 1px solid #ffffff15; border-radius: 10px; padding: 11px 15px; font-size: 12px; color: #e3c1a5; }
 footer { text-align: center; padding: 24px; color: #fff5; font-size: 10px; letter-spacing: .05em; }
 dialog { width: min(680px, calc(100% - 32px)); max-height: 85svh; background: #242424; color: #f5f3f1; border: 1px solid #ffffff17; border-radius: 20px; padding: 24px; box-shadow: 0 30px 100px #0008; }
@@ -67,15 +79,15 @@ dt { color: #fff9; } dd { margin: 0; text-align: left; overflow-wrap: anywhere; 
 @media (max-height: 800px) {
   header { padding-block: 16px; }
   main { padding-block: 12px; }
-  .cover { width: min(100%, clamp(100px, calc(100svh - 365px), 320px)); margin-inline: auto; }
+  .cover { width: min(100%, clamp(70px, calc(100svh - 460px), 320px)); margin-inline: auto; }
   .track { margin-top: 18px; }
   .eyebrow { margin-bottom: 8px; }
   h1 { font-size: 28px; }
   .artist { font-size: 15px; margin-top: 7px; }
   .album { font-size: 12px; margin-top: 5px; }
   .playback-info { margin-top: 14px; }
-  .format, .volume { margin-top: 5px; }
   footer { padding-block: 12px; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+@media (max-height: 540px) { .audio-formats { margin-top: 12px; } .format + .format:not(:empty) { margin-top: 8px; } .playback-info { margin-top: 8px; } }
 @media (prefers-reduced-motion: reduce) { .ambience img, #log-state { transition: none; } #log-state.log-pulse { animation: none; } }

@@ -69,8 +69,17 @@ then send AirPlay audio to this bridge as one endpoint.
 ![Playback page, connection details, and live logs](docs/status-page.gif)
 
 The animation uses fictional track, speaker, and log data.
-The page shows artwork, track information, AirPlay version, audio format,
-speaker state, and volume. It is read-only and sends no playback or volume commands.
+The page shows artwork, track information, AirPlay version, playback state, and
+volume. Separate Received and Output rows show the incoming audio format and the
+FLAC stream sent to the recipient. Channel badges distinguish stereo (2.0), 5.1,
+and 7.1 input from stereo output. It is read-only and sends no playback or volume commands.
+
+With a receiver that provides `ssnc/abrt` and `ssnc/arst` metadata, the Received row
+also shows the measured average AAC input bitrate. Connection details show session
+totals for missing audio blocks, too-late blocks, and retry requests. These counters
+are receiver observations, not a general network packet-loss measurement.
+When these optional metadata messages are absent, bitrate is omitted and the
+counters appear as unavailable.
 
 Open the menu for connection details or live bridge logs. Logs follow new entries
 until you scroll up. Select the new-entry button to resume following.

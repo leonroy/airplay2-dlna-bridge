@@ -192,6 +192,8 @@ def test_live_indicator_pulses_without_entries_and_respects_reduced_motion(log_p
 def playing_status(bridge, artwork=None, title="Once Upon a Time In the West"):
     data = bridge.status_snapshot()
     data["audio"].update(state="receiving", codec="AAC", airplay_version=2,
+                         source_format="AAC/48000/F24/2",
+                         output_stream={"codec": "FLAC", "rate": 48000, "bits": 32, "channels": 2},
                          format={"rate": 48000, "bits": 32, "channels": 2})
     data["track"].update(title=title, artist="Example Artist", album="Example Album", artwork=artwork)
     data["recipient"].update(configured=True, name="Example Speaker")
@@ -258,8 +260,12 @@ def test_small_windows_fit_track_metadata_and_popups(bridge_page, bridge, width,
     page.set_viewport_size({"width": width, "height": height})
     if font:
         page.add_style_tag(content=f":root {{ font-family: {font}; }}")
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/demo.svg"))
-    expect(page.locator("#codec")).to_have_text("AirPlay 2 · AAC → FLAC")
+    value = playing_status(bridge, "/demo.svg")
+    value["audio"].update(source_format="AAC/48000/F24/7.1", aac_bitrate_bps=256000)
+    page.evaluate("value => window.testLogs.status(value)", value)
+    expect(page.locator("#codec")).to_have_text("ReceivedAAC · 7.1 · 48 kHz · 256 kbps")
+    expect(page.locator("#status-text")).to_have_text("AirPlay 2 · Playing")
+    expect(page.locator("#volume")).to_have_text("Volume · 25%")
     page.wait_for_function("document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth", timeout=5000)
     for selector in ("#title", "#artist", "#album", "#status", "#codec", "#format", "#volume", "footer"):
         rect = page.locator(selector).bounding_box()
@@ -349,7 +355,7 @@ def test_closed_sources_retry_with_backoff_and_recover(log_page, bridge):
     assert page.evaluate('window.testLogs.count()') == initial + 3
     expect(page.locator('#log-state')).to_have_text('Live')
     page.evaluate('value => window.testLogs.status(value)', playing_status(bridge))
-    expect(page.locator('#status-text')).to_contain_text('Receiving AirPlay')
+    expect(page.locator('#status-text')).to_have_text('AirPlay 2 · Playing')
     expect(page.locator('#issue')).to_be_hidden()
 
 
