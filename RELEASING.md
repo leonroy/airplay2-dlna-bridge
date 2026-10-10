@@ -87,8 +87,8 @@ After a merge into `development`, passing builds publish the receiver's `develop
 The workflow uses `GITHUB_TOKEN` and requires no additional registry secret.
 
 Production Compose hardcodes `ghcr.io/leonroy/shairport-sync:latest`.
-The first `latest` image requires the receiver PR to merge and its publishing workflow to pass.
-Complete that step before deploying this Compose change.
+The receiver's `latest` tag follows tested `development` builds, including pushes and merges.
+Pushes and merges to `master` do not publish receiver images to GHCR.
 The GHCR package must permit public downloads.
 Follow the [receiver image guide](https://github.com/leonroy/shairport-sync/blob/development/docker/FORK.md) for publication, updates, and rollback.
 
