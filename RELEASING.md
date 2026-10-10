@@ -77,6 +77,21 @@ are not overwritten. Retrying an older version cannot move `latest` backwards.
 Candidate tags are retained. Image references and digests appear in the Actions
 job summary. The image is linked to this repository using its source label.
 
+The receiver image comes from [leonroy/shairport-sync](https://github.com/leonroy/shairport-sync).
+Its GitHub Actions workflow builds and tests Linux AMD64 and ARM64 images with the telemetry from upstream PR #2305.
+It compiles Classic AirPlay and AirPlay 2 with metadata enabled and disabled.
+Runtime tests cover both receiver modes and the matching NQPTP shared-memory interface.
+Pull request runs do not publish images.
+The receiver PR branch publishes a commit-specific candidate for review.
+After a merge into `development`, passing builds publish the receiver's `development` and `latest` tags.
+The workflow uses `GITHUB_TOKEN` and requires no additional registry secret.
+
+Production Compose hardcodes `ghcr.io/leonroy/shairport-sync:latest`.
+The first `latest` image requires the receiver PR to merge and its publishing workflow to pass.
+Complete that step before deploying this Compose change.
+The GHCR package must permit public downloads.
+Follow the [receiver image guide](https://github.com/leonroy/shairport-sync/blob/development/docker/FORK.md) for publication, updates, and rollback.
+
 After the first successful publish, open your GitHub profile's **Packages**,
 select **airplay2-dlna-bridge**, and open **Package settings → Change visibility →
 Public**. GitHub initially creates the package as private. Verify an anonymous

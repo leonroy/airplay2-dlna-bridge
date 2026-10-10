@@ -19,7 +19,8 @@ depends on the audio format sent over AirPlay.
 
 Use a Docker host with Compose and host networking for AirPlay discovery and
 timing. The sender, Docker host, and speaker must share a local network.
-The supplied Shairport Sync container provides the AirPlay receiver.
+The supplied [Shairport Sync fork](https://github.com/leonroy/shairport-sync) provides the AirPlay receiver.
+Its `ghcr.io/leonroy/shairport-sync:latest` image follows the tested development branch and includes receiver telemetry.
 Shairport Sync 5 or later is required for audio format metadata.
 
 On the Docker host, create a deployment folder and download the configuration:
@@ -74,8 +75,8 @@ volume. Separate Received and Output rows show the incoming audio format and the
 FLAC stream sent to the recipient. Channel badges distinguish stereo (2.0), 5.1,
 and 7.1 input from stereo output. It is read-only and sends no playback or volume commands.
 
-With a receiver that provides `ssnc/abrt` and `ssnc/arst` metadata, the Received row
-also shows the measured average AAC input bitrate. Connection details show session
+The supplied receiver provides `ssnc/abrt` and `ssnc/arst` metadata.
+The Received row also shows the measured average AAC input bitrate. Connection details show session
 totals for missing audio blocks, too-late blocks, and retry requests. These counters
 are receiver observations, not a general network packet-loss measurement.
 When these optional metadata messages are absent, bitrate is omitted and the
@@ -121,7 +122,7 @@ Keep the supplied `shairport-sync.conf` for ordinary installations.
 It contains only bridge-specific settings: pipe output, shared audio and metadata
 paths, automatic audio rate and format selection, and speaker volume handling.
 Shairport supplies stereo output, enabled metadata and artwork, the session
-timeout, and normal logging from its [defaults](https://github.com/mikebrady/shairport-sync/blob/master/scripts/shairport-sync.conf).
+timeout, and normal logging from its [defaults](https://github.com/leonroy/shairport-sync/blob/development/scripts/shairport-sync.conf).
 The receiver image also provides
 the standard configuration path and receiver ports.
 
@@ -152,6 +153,21 @@ docker compose up -d bridge
 
 After replacing the bridge, disconnect and reconnect AirPlay to send fresh audio
 format metadata. See [RELEASING.md](RELEASING.md) for image publishing and release details.
+
+The receiver image is hardcoded as `ghcr.io/leonroy/shairport-sync:latest` in Compose.
+It follows tested merges into the fork's `development` branch.
+To update the receiver, run these commands on the Docker host:
+
+```bash
+docker compose pull shairport-sync
+docker compose up -d shairport-sync
+```
+
+Disconnect and reconnect AirPlay after replacing the receiver.
+For rollback, replace the receiver image in Compose with a recorded `sha-<full-commit-sha>` tag or manifest digest.
+A manifest digest identifies one set of images.
+Then run the same commands on the Docker host.
+The receiver's Actions summary records the tested tag and digest.
 
 ### Separate AirPlay 1 and AirPlay 2 endpoints
 

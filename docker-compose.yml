@@ -6,7 +6,7 @@
 services:
   # AirPlay receiver (nqptp is bundled inside this image)
   shairport-sync:
-    image: mikebrady/shairport-sync:latest
+    image: ghcr.io/leonroy/shairport-sync:latest
     network_mode: host
     restart: unless-stopped
     depends_on:

@@ -104,6 +104,7 @@ def test_separate_endpoints_have_independent_stream_ports_and_volumes(compose):
     classic = compose({"AIRPLAY_VERSION": "1", "STREAM_PORT": "8001"}, project="classic-test")
     airplay2 = compose(project="airplay2-test")
     for model, port in [(classic, "8001"), (airplay2, "8000")]:
+        assert model["services"]["shairport-sync"]["image"] == "ghcr.io/leonroy/shairport-sync:latest"
         bridge = model["services"]["bridge"]
         assert bridge["ports"][0]["published"] == port
         assert bridge["environment"]["STREAM_URL"] == f"http://192.0.2.10:{port}/stream.flac"
