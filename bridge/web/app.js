@@ -29,7 +29,37 @@
 
   const duration = (value) => value == null ? "—" : `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
   const bytes = (value) => value >= 1048576 ? `${(value / 1048576).toFixed(1)} MiB` : `${(value / 1024).toFixed(1)} KiB`;
-  const format = (pcm) => pcm ? `${pcm.rate / 1000} kHz · ${pcm.bits}-bit · ${pcm.channels === 2 ? "Stereo" : "Mono"}` : "Format not received";
+  const channelLabel = (channels) => channels === "1" ? "Mono" : channels === "2" ? "Stereo" :
+    ["5.1", "7.1"].includes(channels) ? channels : `${channels} channels`;
+  const receivedFormat = (description) => {
+    const match = typeof description === "string" && description.match(/^(ALAC|AAC|PCM)\/([0-9]{4,6})\/[A-Z0-9_]+\/([1-8]|5\.1|7\.1)$/);
+    return match ? `${match[1]} · ${channelLabel(match[3])} · ${Number(match[2]) / 1000} kHz` : "Unknown";
+  };
+  const outputFormat = (stream) => stream ?
+    `${stream.codec} · ${channelLabel(String(stream.channels))} · ${stream.rate / 1000} kHz · ${stream.bits}-bit` : "Unknown";
+  function formatRow(node, label, parts, incoming = false) {
+    node.replaceChildren();
+    if (!parts) return;
+    const title = document.createElement("span"); title.className = "format-label"; title.textContent = label;
+    node.append(title);
+    parts.forEach((part, index) => {
+      if (index) {
+        const separator = document.createElement("span"); separator.className = "format-separator";
+        separator.textContent = part ? " · " : ""; node.append(separator);
+      }
+      const value = document.createElement("span"); value.textContent = part;
+      if (index === 0) value.className = "format-codec";
+      if (index === 1) value.className = `channel-badge${incoming ? " incoming" : ""}`;
+      if (parts.length === 1) value.className = "format-unknown";
+      if (part.endsWith(" kbps")) { value.title = "Input AAC bitrate (measured average)"; value.setAttribute("aria-label", `${part}, input AAC measured average`); }
+      node.append(value);
+    });
+  }
+  const channelBadge = (channels) => channels === "2" ? "2.0" : channels === "1" ? "1.0" :
+    ["5.1", "7.1"].includes(channels) ? channels : `${channels}ch`;
+  const aacBitrate = (audio) => audio.codec === "AAC" &&
+    Number.isFinite(audio.aac_bitrate_bps) && audio.aac_bitrate_bps > 0
+      ? `${Math.round(audio.aac_bitrate_bps / 1000)} kbps (measured average)` : "";
   const observed = (field) => field.at ? `${Math.max(0, Math.floor(Date.now() / 1000 - field.at))} seconds ago` : "Not yet observed";
   const fieldValue = (field, volume = false) => {
     if (field.error === "unavailable") return "Unavailable";
@@ -43,9 +73,13 @@
     const rows = [
       ["Bridge", demo ? "Demo" : "Online"], ["Uptime", duration(data.uptime_seconds)],
       ["AirPlay input", labels[data.audio.state] || "Unknown"], ["Session", data.audio.session ?? "None"],
-      ["Session age", duration(data.audio.age_seconds)], ["Audio format", format(data.audio.format)],
+      ["Session age", duration(data.audio.age_seconds)], ["Output stream", outputFormat(data.audio.output_stream)],
       ["AirPlay version", data.audio.airplay_version ? `AirPlay ${data.audio.airplay_version}` : "Unknown"],
-      ["Input codec", data.audio.codec || "Unknown"], ["Speaker stream", "FLAC"],
+      ["Received from AirPlay", receivedFormat(data.audio.source_format)],
+      ...(data.audio.codec === "AAC" ? [["AAC bitrate (measured average)", aacBitrate(data.audio) || "Unavailable"]] : []),
+      ["Missing audio blocks (session)", data.audio.receiver_stats?.missing_audio_blocks ?? "Unavailable"],
+      ["Too-late audio blocks (session)", data.audio.receiver_stats?.too_late_audio_blocks ?? "Unavailable"],
+      ["Retry requests (session)", data.audio.receiver_stats?.retry_requests ?? "Unavailable"],
       ["Buffered audio", bytes(data.audio.buffered_bytes)], ["Waiting for format", bytes(data.audio.pending_bytes)],
       ["Received audio", bytes(data.audio.raw_bytes)], ["Discarded audio", bytes(data.audio.discarded_bytes)],
       ["Audio connections", data.connections],
@@ -86,15 +120,16 @@
     }
     $("artwork").alt = data.track.artwork ? `Cover art for ${data.track.album || data.track.title || "the current track"}` : "No cover art";
     const recipient = data.recipient;
-    let recipientText = "Recipient not configured";
-    if (recipient.configured) {
-      recipientText = recipient.playback.stale ? "Recipient status stale" : `Recipient ${fieldValue(recipient.playback).toLowerCase()}`;
-    }
-    $("status-text").textContent = `${labels[data.audio.state] || "Unknown input state"} · ${recipientText}`;
+    const protocol = data.audio.airplay_version ? `AirPlay ${data.audio.airplay_version}` : "AirPlay";
+    const playback = recipient.configured ? recipient.playback.stale ? "Status stale" : fieldValue(recipient.playback) : "Receiving";
+    $("status-text").textContent = data.audio.state === "receiving" ? `${protocol} · ${playback}` : labels[data.audio.state] || "Unknown input state";
     $("status").dataset.state = data.audio.state;
-    $("format").textContent = data.audio.format ? format(data.audio.format) : "";
-    $("codec").textContent = active ? `${data.audio.airplay_version ? `AirPlay ${data.audio.airplay_version}` : "AirPlay version unknown"} · ${data.audio.codec || "Codec unknown"} → FLAC` : "";
-    $("volume").textContent = recipient.configured && recipient.volume.value != null && !recipient.volume.error && !recipient.volume.stale ? `Recipient volume ${recipient.volume.value}%` : "";
+    const input = typeof data.audio.source_format === "string" && data.audio.source_format.match(/^(ALAC|AAC|PCM)\/([0-9]{4,6})\/([A-Z0-9_]+)\/([1-8]|5\.1|7\.1)$/);
+    const inputBits = input && input[1] !== "AAC" && input[3].match(/^S(16|24|32)(?:_|$)/);
+    formatRow($("codec"), "Received", active ? input ? [input[1], channelBadge(input[4]), `${Number(input[2]) / 1000} kHz`, inputBits ? `${inputBits[1]}-bit` : aacBitrate(data.audio).replace(" (measured average)", "")] : ["Unknown"] : null, true);
+    const stream = data.audio.output_stream;
+    formatRow($("format"), "Output", active ? stream ? [stream.codec, channelBadge(String(stream.channels)), `${stream.rate / 1000} kHz`, `${stream.bits}-bit`] : ["Unknown"] : null);
+    $("volume").textContent = recipient.configured && recipient.volume.value != null && !recipient.volume.error && !recipient.volume.stale ? `Volume · ${recipient.volume.value}%` : "";
     let issue = "";
     if (data.audio.state === "error") issue = "Audio session failed. View details.";
     else if (data.audio.state === "waiting") issue = "Waiting for audio format. View details.";
@@ -224,7 +259,7 @@
       updateLogState(demo ? "Demo" : "Connecting…");
       if (demo && !lines.length) {
         addLog("[bridge] Sample session started");
-        addLog("[bridge] Sample audio format: 44100/S16_LE/2");
+        addLog("[bridge] Sample audio format: 48000/S32_LE/2");
         addLog("[bridge] Sample recipient Play accepted");
       }
       connect();
@@ -269,7 +304,11 @@
       instance: "demo", uptime_seconds: 3720,
       audio: { state: scenario === "waiting" ? "waiting" : active ? "receiving" : "idle", session: active ? 12 : null,
         codec: active ? "AAC" : null, airplay_version: active ? 2 : null, stream_type: active ? "Buffered" : null,
-        age_seconds: active ? 84 : null, format: scenario === "waiting" || !active ? null : { rate: 44100, bits: 16, channels: 2 },
+        source_format: active ? "AAC/48000/F24/5.1" : null,
+        output_stream: scenario === "waiting" || !active ? null : { codec: "FLAC", rate: 48000, bits: 32, channels: 2 },
+        aac_bitrate_bps: active ? 256000 : null,
+        receiver_stats: active ? { missing_audio_blocks: 0, too_late_audio_blocks: 0, retry_requests: 0 } : null,
+        age_seconds: active ? 84 : null, format: scenario === "waiting" || !active ? null : { rate: 48000, bits: 32, channels: 2 },
         buffered_bytes: active ? 2116800 : 0, pending_bytes: scenario === "waiting" ? 176400 : 0, raw_bytes: active ? 14817600 : 0, discarded_bytes: 0 },
       track: { title: active ? "Evening Drive" : "", artist: active ? "Example Artist" : "", album: active ? "After the Light" : "", artwork: active ? "/demo.svg" : null },
       connections: active && scenario !== "waiting" && scenario !== "failure" ? 1 : 0,

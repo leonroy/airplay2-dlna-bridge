@@ -153,8 +153,13 @@ class PCMFormat(collections.namedtuple("PCMFormatBase", "rate format channels"))
             return b"".join(data[i:i + storage][::-1] for i in range(0, len(data), storage))
         return data
 
+    @property
+    def flac_bits(self):
+        # FLAC stores 8-bit input losslessly as 16-bit samples.
+        return max(16, self.bits)
+
     def encoder_command(self):
-        bits = max(16, self.bits)  # FLAC stores 8-bit input losslessly as 16-bit samples.
+        bits = self.flac_bits
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                    "-f", self.ffmpeg_format, "-ar", str(self.rate),
                    "-ac", str(self.channels), "-i", "pipe:0",
@@ -262,6 +267,8 @@ class AudioStream:
         self.ring = None
         self.pcm = None
         self.source_codec = self.stream_type = None
+        self.source_description = self.aac_bitrate_bps = None
+        self.receiver_stats = None
         self.pending = bytearray()
         self.active = False
         self.failed = False
@@ -366,6 +373,8 @@ class AudioStream:
                 self.ring.close()
             self.ring = self.pcm = None
             self.source_codec = self.stream_type = None
+            self.source_description = self.aac_bitrate_bps = None
+            self.receiver_stats = None
             self.pending.clear()
             self.active = self.failed = False
             self.session_id = self.started = self.first_audio = self.wait_logged = None
@@ -383,6 +392,8 @@ class AudioStream:
             self.discarded_bytes += len(self.pending)
             self.pending.clear()
             self.failed = True
+            self.aac_bitrate_bps = None
+            self.receiver_stats = None
 
     def describe(self, data):
         with self.lock:
@@ -1572,8 +1583,14 @@ def status_snapshot():
                  "receiving" if AUDIO.active and AUDIO.first_audio is not None else "idle")
         pcm = ({"rate": AUDIO.pcm.rate, "bits": AUDIO.pcm.bits, "channels": AUDIO.pcm.channels}
                if AUDIO.pcm else None)
+        output_stream = ({"codec": "FLAC", "rate": AUDIO.pcm.rate,
+                          "bits": AUDIO.pcm.flac_bits, "channels": AUDIO.pcm.channels}
+                         if AUDIO.pcm else None)
         audio = {"state": state, "session": AUDIO.session_id,
                  "codec": AUDIO.source_codec, "stream_type": AUDIO.stream_type,
+                 "source_format": AUDIO.source_description, "output_stream": output_stream,
+                 "aac_bitrate_bps": AUDIO.aac_bitrate_bps,
+                 "receiver_stats": dict(AUDIO.receiver_stats) if AUDIO.receiver_stats is not None else None,
                  "airplay_version": {"Classic": 1, "Realtime": 2, "Buffered": 2}.get(AUDIO.stream_type),
                  "age_seconds": round(now - AUDIO.started, 1) if AUDIO.started is not None else None,
                  "format": pcm, "pending_bytes": len(AUDIO.pending), "buffered_bytes": 0,
@@ -1807,11 +1824,47 @@ def handle_playback_metadata(code, data, wiim, pending):
         with AUDIO.lock:
             if code == "styp" and value in ("Classic", "Realtime", "Buffered"):
                 AUDIO._ensure_session()
+                if AUDIO.stream_type != value:
+                    AUDIO.aac_bitrate_bps = None
                 AUDIO.stream_type = value
-            elif code == "sdsc" and re.fullmatch(r"(ALAC|AAC|PCM)/[0-9]{4,6}/[A-Z0-9_]+/[1-8]", value):
+            elif code == "sdsc" and re.fullmatch(r"(ALAC|AAC|PCM)/[0-9]{4,6}/[A-Z0-9_]+/(?:[1-8]|5\.1|7\.1)", value):
                 AUDIO._ensure_session()
+                if AUDIO.source_description != value:
+                    AUDIO.aac_bitrate_bps = None
+                AUDIO.source_description = value
                 AUDIO.source_codec = value.split("/", 1)[0]
         return True
+    elif code == "arst":
+        # Player counters are session totals, not network packet-loss estimates.
+        if not re.fullmatch(rb"[0-9]{1,20}/[0-9]{1,20}/[0-9]{1,20}", data):
+            return True
+        counts = tuple(map(int, data.split(b"/")))
+        with AUDIO.lock:
+            if (AUDIO.session_id is not None and AUDIO.accepting and not AUDIO.failed
+                    and all(value <= (1 << 53) - 1 for value in counts)):
+                AUDIO.receiver_stats = dict(zip(
+                    ("missing_audio_blocks", "too_late_audio_blocks", "retry_requests"), counts))
+        return True
+    elif code == "abrt":
+        # Custom receiver counters describe compressed AAC, never decoded PCM.
+        if not re.fullmatch(rb"[0-9]{1,20}/[0-9]{1,20}/[0-9]{1,5}", data):
+            return True
+        payload_bytes, samples, rate = map(int, data.split(b"/"))
+        with AUDIO.lock:
+            if (payload_bytes, samples, rate) == (0, 0, 0):
+                AUDIO.aac_bitrate_bps = None
+            elif (AUDIO.source_codec == "AAC" and AUDIO.session_id is not None
+                  and AUDIO.accepting and not AUDIO.failed and rate in (44100, 48000)
+                  and rate == int(AUDIO.source_description.split("/")[1])
+                  and 0 < payload_bytes <= (1 << 64) - 1
+                  and 2 * rate <= samples <= (1 << 64) - 1):
+                bps = (payload_bytes * 8 * rate + samples // 2) // samples
+                if 0 < bps <= 10_000_000:
+                    AUDIO.aac_bitrate_bps = bps
+        return True
+    elif code == "pfls":
+        with AUDIO.lock:
+            AUDIO.aac_bitrate_bps = None
     elif code == "odsc":
         handle_output_description(data, wiim)
     elif code == "pbeg":

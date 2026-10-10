@@ -19,16 +19,20 @@ def test_source_metadata_reports_negotiated_codec_and_protocol_and_resets(bridge
     audio = bridge.status_snapshot()['audio']
     assert audio['airplay_version'] == version
     assert audio['codec'] == codec
+    assert audio['source_format'] == f'{codec}/48000/F24/2'
     bridge.handle_playback_metadata('pend', b'', renderer, pending)
     audio = bridge.status_snapshot()['audio']
     assert audio['codec'] is None
+    assert audio['source_format'] is None
+    assert audio['output_stream'] is None
     assert audio['airplay_version'] is None
 
 
-def test_unrecognized_source_metadata_does_not_guess_airplay_version(bridge):
+@pytest.mark.parametrize("description", [b"invalid\xff", b"AAC/48000/F24/5.0", b"AAC/48000/F24/7.10", b"AAC/48000/F24/5.1\n"])
+def test_unrecognized_source_metadata_does_not_guess_airplay_version(bridge, description):
     renderer = Mock()
     bridge.handle_playback_metadata('styp', b'Unknown', renderer, {})
-    bridge.handle_playback_metadata('sdsc', b'invalid\xff', renderer, {})
+    bridge.handle_playback_metadata('sdsc', description, renderer, {})
     audio = bridge.status_snapshot()['audio']
     assert audio['airplay_version'] is None
     assert audio['codec'] is None
