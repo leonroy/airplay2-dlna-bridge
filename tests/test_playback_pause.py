@@ -138,6 +138,44 @@ def test_discarded_partial_frames_cannot_shift_resumed_channels(bridge, monkeypa
     assert not bridge.AUDIO.pending
 
 
+@pytest.mark.parametrize("offset", range(1, 6))
+@pytest.mark.parametrize("paused_bytes", [0, 1, 5, 6, 7])
+def test_consecutive_pauses_preserve_partial_frame_offset(bridge, offset, paused_bytes):
+    renderer = Mock()
+    audio = bridge.AUDIO
+    audio.begin()
+    audio.describe("44100/S24_3LE/2")
+    # Distinct samples and channels expose a byte shift in the resumed output.
+    source = (b"\x11\x22\x33\x44\x55\x66"
+              b"\x77\x88\x99\xaa\xbb\xcc"
+              b"\x03\x00\x00\x04\x00\x00"
+              b"\xfd\xff\xff\xfc\xff\xff")
+    audio.feed(source[:1])
+    audio.pause(now=100)
+    audio.maintain(renderer, now=100.75)
+    audio.resume_playback(now=101)
+    audio.feed(source[1:offset])  # Resume before the discarded frame is complete.
+    assert not audio.pending
+    assert audio.awaiting_pcm
+
+    audio.pause(now=102)
+    audio.maintain(renderer, now=102.75)
+    audio.feed(source[offset:offset + paused_bytes])
+    audio.resume_playback(now=103)
+    consumed = offset + paused_bytes
+    # Continue the same PCM input in byte-sized fragments across the frame edge.
+    for byte in source[consumed:]:
+        audio.feed(bytes([byte]))
+    first_complete_frame = (consumed + 5) // 6 * 6
+    expected = source[first_complete_frame:]
+    assert audio.ring.read_from(0)[1] == expected
+    assert audio.discarded_bytes == first_complete_frame
+    assert audio.pcm_bytes == len(expected)
+    assert not audio.pending
+    assert not audio.discard_alignment
+    assert not audio.awaiting_pcm
+
+
 @pytest.mark.parametrize("method", ["serve_flac", "serve_wav"])
 def test_pause_reconnects_at_fifteen_and_thirty_seconds_never_start_audio(bridge, playback, method):
     renderer, clock = playback

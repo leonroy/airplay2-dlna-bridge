@@ -366,7 +366,9 @@ class AudioStream:
                     ring.close()
                     cancel_ring_clients(ring, "sustained pause")
                 self.discarded_bytes += len(self.pending)
-                self.discard_alignment = len(self.pending) % self.pcm.source_frame if self.pcm else 0
+                # A prior pause may still be discarding an incomplete frame.
+                self.discard_alignment = ((self.discard_alignment + len(self.pending))
+                                          % self.pcm.source_frame if self.pcm else 0)
                 self.pending.clear()
                 wiim.stop(self.session_id, preserve_volume=True)
                 log_timing("pause_stop", self.session_id, self.playback_generation)
