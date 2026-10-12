@@ -137,7 +137,13 @@ If you used `docker-compose.airplay1.yml`, switch to the main Compose file with
 `AIRPLAY_VERSION=1` in `.env`.
 
 Speaker control uses the fixed UPnP description port `49152`.
-Seek and pause do not force audio connections to close.
+AirPlay pauses immediately block new audio connections with HTTP 503 and
+`Retry-After: 1`. Existing streams remain open for a 750 ms grace period to
+allow brief track-change pauses. Longer pauses close those streams and send
+Stop to the speaker. After a longer pause, resume starts a fresh stream when new audio arrives,
+so reconnects cannot replay audio from before the pause. The status page shows
+“AirPlay paused” and retains the track information and artwork.
+Seek alone does not force audio connections to close.
 If automatic control is disabled, open `http://<HOST_IP>:<STREAM_PORT>/stream.flac`
 on the speaker manually.
 
@@ -220,6 +226,14 @@ For startup delays, inspect the `timing` records for `playback_ready`,
 `command_start`/`command_end`, `flac_connected`, `flac_pcm`, and `flac_frame`.
 Command success confirms a valid speaker response. The first FLAC frame is
 measured before socket writing, so neither measure confirms audible playback.
+
+Pause and resume logs include the local session and playback generation.
+`pcm_stall` records gaps longer than two seconds during expected playback;
+`pcm_recovered` records their duration. Explicit pauses do not count as stalls.
+Audio diagnostics record receiver counters, byte totals, slow-reader ring
+overruns, and rejected paused reconnects every 30 seconds during playback,
+at pause, and before session cleanup. These counters help locate a stutter but
+do not prove network packet loss or confirm what the speaker played.
 
 ## Advanced details
 

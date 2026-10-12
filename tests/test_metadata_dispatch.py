@@ -86,7 +86,8 @@ def test_seek_and_pause_preserve_audio_connections(monkeypatch, request, code, l
     try:
         with pytest.raises(Finished):
             bridge.metadata_reader(renderer)
-        assert bridge.AUDIO.snapshot() is ring
+        assert bridge.AUDIO.ring is ring
+        assert (bridge.AUDIO.snapshot() is None) == (code == 'paus')
         assert bridge.STATE['active']
         assert ring.session_start == position
         assert ring.read_from(position)[1] == audio

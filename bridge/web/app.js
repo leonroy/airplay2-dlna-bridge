@@ -11,7 +11,7 @@
   let following = true, unreadLogs = 0, pendingLogCount = 0;
   let logConnection = demo ? "Demo" : "Connecting…";
   const encoder = new TextEncoder();
-  const labels = { idle: "Ready for AirPlay", receiving: "Receiving AirPlay", waiting: "Waiting for audio format", error: "Audio session error" };
+  const labels = { idle: "Ready for AirPlay", receiving: "Receiving AirPlay", paused: "AirPlay paused", waiting: "Waiting for audio format", error: "Audio session error" };
   const playbackLabels = { PLAYING: "Playing", PAUSED_PLAYBACK: "Paused", STOPPED: "Stopped", TRANSITIONING: "Starting", NO_MEDIA_PRESENT: "No media" };
   let backdropRequest = 0;
   function updateBackdrop(src) {
