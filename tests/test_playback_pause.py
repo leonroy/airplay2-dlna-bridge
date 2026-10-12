@@ -36,6 +36,15 @@ def actions(renderer):
     return [call.args[0] for call in renderer.action.call_args_list]
 
 
+def rejected_fetch(bridge):
+    handler = object.__new__(bridge.StreamHandler)
+    handler.send_response = Mock()
+    handler.send_header = Mock()
+    handler.end_headers = Mock()
+    handler.serve_flac()
+    handler.send_response.assert_called_once_with(503)
+
+
 @pytest.mark.parametrize("duration", [.234, .372, .749])
 @pytest.mark.parametrize("resume_code", ["pres", "prsm"])
 def test_brief_pause_preserves_stream_without_transport_commands(bridge, playback, duration, resume_code):
@@ -205,7 +214,7 @@ def test_sustained_pause_releases_existing_stream_resources(bridge, stream_probe
     assert client.ring.closed
     probe.finished()
     assert not bridge.CLIENTS
-    renderer.stop.assert_called_once_with(client.session_id)
+    renderer.stop.assert_called_once_with(client.session_id, preserve_volume=True)
 
 
 def test_old_ring_cleanup_cannot_cancel_resumed_ring(bridge, playback):
@@ -247,6 +256,153 @@ def test_pause_racing_inflight_playback_does_not_play_until_resume(bridge, playb
     renderer.dispatch_once()
     assert actions(renderer).count("SetAVTransportURI") == 1
     assert actions(renderer).count("Play") == 1
+
+
+@pytest.mark.parametrize("kind", ["initial", "resume"])
+@pytest.mark.parametrize("resume_before_ack", [False, True])
+def test_rejected_fetch_during_inflight_play_is_retried_on_brief_resume(
+        bridge, playback, monkeypatch, kind, resume_before_ack):
+    renderer, clock = playback
+    monkeypatch.setattr(bridge, "DIDL_PUSH", False)
+    if kind == "initial":
+        bridge.STATE["pushed"] = None
+        bridge.STATE["dirty"] = 99
+        renderer.dispatch_once()  # Install the URI before the in-flight Play.
+    else:
+        renderer.resume(bridge.AUDIO.session_id)
+    def play_action(name, *_):
+        assert name == "Play"
+        event(bridge, renderer, "paus")
+        rejected_fetch(bridge)
+        if resume_before_ack:
+            clock.return_value += .372
+            event(bridge, renderer, "pres")
+        return True  # SOAP success despite the speaker's rejected HTTP fetch.
+    renderer.action.side_effect = play_action
+    renderer.dispatch_once()
+    if kind == "initial":
+        assert renderer.job[1] == "play"
+        assert bridge.STATE["pushed"] is None
+    if not resume_before_ack:
+        assert not renderer.dispatch_once()
+        clock.return_value += .372
+        event(bridge, renderer, "pres")
+    renderer.action.side_effect = None
+    assert renderer.dispatch_once()  # No two-second gap or new PCM needed.
+    expected = ["SetAVTransportURI", "Play", "Play"] if kind == "initial" else ["Play", "Play"]
+    assert actions(renderer) == expected
+    assert renderer.job is None
+    assert renderer.resume_session is None
+    assert not renderer.dispatch_once()
+
+
+def test_fetch_rejected_after_play_ack_still_requeues_resume(bridge, playback):
+    renderer, clock = playback
+    event(bridge, renderer, "paus")
+    rejected_fetch(bridge)
+    clock.return_value += .234
+    event(bridge, renderer, "pres")
+    event(bridge, renderer, "prsm")  # Duplicate resume must not enqueue twice.
+    assert renderer.dispatch_once()
+    assert actions(renderer) == ["Play"]
+    assert not renderer.dispatch_once()
+
+
+@pytest.mark.parametrize("method", ["serve_flac", "serve_wav"])
+def test_resume_before_rejection_headers_preserves_fetch_recovery(bridge, playback, method):
+    renderer, clock = playback
+    def play_action(name, *_):
+        assert name == "Play"
+        event(bridge, renderer, "paus")
+        handler = object.__new__(bridge.StreamHandler)
+        handler.send_response = Mock()
+        handler.send_header = Mock()
+        handler.end_headers = Mock()
+        send_rejection = handler.reject_audio
+        def resume_then_reject(retrying):
+            clock.return_value += .234
+            event(bridge, renderer, "pres")
+            send_rejection(retrying)
+        handler.reject_audio = resume_then_reject
+        getattr(handler, method)()
+        handler.send_response.assert_called_once_with(503)
+        return True
+    renderer.resume(bridge.AUDIO.session_id)
+    renderer.action.side_effect = play_action
+    renderer.dispatch_once()
+    renderer.action.side_effect = None
+    assert renderer.dispatch_once()
+    assert actions(renderer) == ["Play", "Play"]
+    assert not renderer.dispatch_once()
+
+
+def test_rejected_fetch_recovery_does_not_cross_session_boundary(bridge, playback):
+    renderer, clock = playback
+    event(bridge, renderer, "paus")
+    rejected_fetch(bridge)
+    event(bridge, renderer, "pend")
+    event(bridge, renderer, "pbeg")
+    bridge.handle_output_description(b"48000/S16_LE/2", renderer)
+    event(bridge, renderer, "pres")
+    clock.return_value += 3
+    while renderer.dispatch_once():
+        pass
+    assert actions(renderer) == ["Stop", "SetAVTransportURI", "Play"]
+
+
+@pytest.mark.parametrize("resume_before_stop_ack", [False, True])
+def test_pause_stop_preserves_latest_volume_queued_while_worker_busy(
+        bridge, playback, resume_before_stop_ack):
+    renderer, clock = playback
+    bridge.STATE["pushed"] = None
+    bridge.STATE["dirty"] = 99
+    def busy_uri(name, *_):
+        assert name == "SetAVTransportURI"
+        event(bridge, renderer, "paus")
+        for volume in (20, 45, 70):
+            renderer.set_volume(volume)
+        clock.return_value += .75
+        bridge.AUDIO.maintain(renderer)
+        return True
+    renderer.action.side_effect = busy_uri
+    renderer.dispatch_once()
+    assert renderer.volume[1] == 70
+    def stop_action(name, *_):
+        assert name == "Stop"
+        if resume_before_stop_ack:
+            event(bridge, renderer, "pres")
+            bridge.AUDIO.feed(b"\x03\x00\x04\x00" * 8192)
+        return True
+    renderer.action.side_effect = stop_action
+    renderer.dispatch_once()
+    renderer.action.side_effect = None
+    if not resume_before_stop_ack:
+        event(bridge, renderer, "pres")
+        bridge.AUDIO.feed(b"\x03\x00\x04\x00" * 8192)
+    clock.return_value += 1
+    while renderer.dispatch_once():
+        pass
+    assert actions(renderer) == ["SetAVTransportURI", "Stop", "SetAVTransportURI", "Play", "SetVolume"]
+    assert "<DesiredVolume>70</DesiredVolume>" in renderer.action.call_args.args[1]
+    assert renderer.volume is None
+
+
+@pytest.mark.parametrize("ending", ["pend", "rejection"])
+def test_session_cleanup_still_discards_volume_after_pause_stop(bridge, playback, ending):
+    renderer, clock = playback
+    event(bridge, renderer, "paus")
+    renderer.set_volume(70)
+    clock.return_value += .75
+    bridge.AUDIO.maintain(renderer)
+    assert renderer.volume[1] == 70
+    if ending == "pend":
+        event(bridge, renderer, "pend")
+    else:
+        bridge.handle_output_description(b"48000/S16_LE/2", renderer)
+    assert renderer.volume is None
+    while renderer.dispatch_once():
+        pass
+    assert actions(renderer) == ["Stop"]
 
 
 @pytest.mark.parametrize("success", [False, True])

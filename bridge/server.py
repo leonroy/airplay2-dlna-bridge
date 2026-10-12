@@ -297,6 +297,7 @@ class AudioStream:
         self.awaiting_pcm = False
         self.last_pcm = self.stall_since = self.last_diagnostic = None
         self.rejected_reconnects = 0
+        self.pause_fetch_rejected = False
         self.discard_alignment = 0
         self.previous_overruns = 0
 
@@ -320,6 +321,7 @@ class AudioStream:
                 return
             now = time.monotonic() if now is None else now
             self.paused = True
+            self.pause_fetch_rejected = False
             self.pause_deadline = now + PAUSE_GRACE_SECONDS
             self.stall_since = None
             self.diagnostics("pause", now)
@@ -329,7 +331,8 @@ class AudioStream:
     def resume_playback(self, now=None):
         with self.lock:
             if not self.paused or self.failed:
-                return
+                return False
+            retry_fetch = self.pause_fetch_rejected and not self.pause_stopped
             self.paused = False
             self.pause_deadline = None
             if self.pause_stopped:
@@ -342,9 +345,12 @@ class AudioStream:
                 STATE["pushed"] = None
                 mark_metadata_dirty()
             log_timing("resume", self.session_id, self.playback_generation,
-                       mode="fresh" if self.pause_stopped else "grace_cancelled")
+                       mode="fresh" if self.pause_stopped else
+                            "retry_fetch" if retry_fetch else "grace_cancelled")
             self.pause_stopped = False
+            self.pause_fetch_rejected = False
             self.last_pcm = time.monotonic() if now is None else now
+            return retry_fetch
 
     def maintain(self, wiim, now=None):
         """No network I/O: a blocked SOAP command cannot delay ring closure."""
@@ -362,7 +368,7 @@ class AudioStream:
                 self.discarded_bytes += len(self.pending)
                 self.discard_alignment = len(self.pending) % self.pcm.source_frame if self.pcm else 0
                 self.pending.clear()
-                wiim.stop(self.session_id)
+                wiim.stop(self.session_id, preserve_volume=True)
                 log_timing("pause_stop", self.session_id, self.playback_generation)
             if not self.paused and self.last_pcm is not None and now - self.last_pcm > PCM_STALL_SECONDS:
                 if self.stall_since is None:
@@ -474,6 +480,7 @@ class AudioStream:
             self.pause_deadline = None
             self.last_pcm = self.stall_since = self.last_diagnostic = None
             self.rejected_reconnects = 0
+            self.pause_fetch_rejected = False
             self.discard_alignment = self.previous_overruns = 0
 
     def fail(self, reason="invalid output description"):
@@ -1031,13 +1038,17 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     # ---- diagnostic endpoint: pure PCM in a WAV container, never any ICY ----
-    def reject_audio(self):
-        with AUDIO.lock:
-            retrying = AUDIO.paused or AUDIO.awaiting_pcm
-            if AUDIO.paused:
-                AUDIO.rejected_reconnects += 1
-                if AUDIO.rejected_reconnects == 1:
-                    log_timing("paused_reconnect_rejected", AUDIO.session_id, AUDIO.playback_generation)
+    @staticmethod
+    def record_audio_rejection():
+        """Called under AUDIO.lock at admission, before resume can clear pause."""
+        if AUDIO.paused:
+            AUDIO.rejected_reconnects += 1
+            AUDIO.pause_fetch_rejected = True
+            if AUDIO.rejected_reconnects == 1:
+                log_timing("paused_reconnect_rejected", AUDIO.session_id, AUDIO.playback_generation)
+        return AUDIO.paused or AUDIO.awaiting_pcm
+
+    def reject_audio(self, retrying):
         if not retrying:
             log(f"audio request rejected HTTP=503; {AUDIO.status()}")
             self.send_error(503, "Waiting for a valid Shairport output description")
@@ -1052,12 +1063,14 @@ class StreamHandler(BaseHTTPRequestHandler):
     def serve_wav(self):
         with AUDIO.lock:
             ring = AUDIO.snapshot()
-            if ring is not None:
+            if ring is None:
+                retrying = self.record_audio_rejection()
+            else:
                 client = StreamClient(ring, self.connection)
                 pos = ring.join_pos()
                 register_client(client)
         if ring is None:
-            self.reject_audio()
+            self.reject_audio(retrying)
             return
         try:
             if client.cancelled.is_set():
@@ -1087,8 +1100,10 @@ class StreamHandler(BaseHTTPRequestHandler):
         requested_at = time.monotonic()
         with AUDIO.lock:
             ring, revision = AUDIO.snapshot(), STATE["revision"]
+            if ring is None:
+                retrying = self.record_audio_rejection()
         if ring is None:
-            self.reject_audio()
+            self.reject_audio(retrying)
             return
         client = StreamClient(ring, self.connection)
         encoder_slots = ENCODER_SLOTS
@@ -1126,8 +1141,10 @@ class StreamHandler(BaseHTTPRequestHandler):
                 if admitted:
                     join_position = ring.join_pos()
                     register_client(client)
+                else:
+                    retrying = self.record_audio_rejection()
             if not admitted:
-                self.reject_audio()
+                self.reject_audio(retrying)
                 return
             if client.cancelled.is_set():
                 return
@@ -1501,7 +1518,7 @@ class Renderer:
             self.resume_revision += 1
             self.resume_session = (session_id, self.resume_revision)
 
-    def stop(self, session_id=None):
+    def stop(self, session_id=None, *, preserve_volume=False):
         with AUDIO.lock:
             self.stop_revision += 1
             self.stop_session = AUDIO.session_id if session_id is None else session_id
@@ -1509,7 +1526,7 @@ class Renderer:
             # Clear only commands belonging to the ending/rejected session.
             if self.resume_session and self.resume_session[0] == self.stop_session:
                 self.resume_session = None
-            if self.volume and self.volume[0] == self.stop_session:
+            if not preserve_volume and self.volume and self.volume[0] == self.stop_session:
                 self.volume = None
 
     def _current(self, snapshot):
@@ -1616,6 +1633,7 @@ class Renderer:
             revision = value.revision if kind == "playback" else (
                 value if kind == "stop" else value[-1])
             attempt = self.retries[kind]["failures"] + 1
+            fetch_rejections = AUDIO.rejected_reconnects
         started_at = time.monotonic()
         log_timing("command_start", session, revision, kind=kind, action=name, attempt=attempt)
         success = self.action(name, args, "RenderingControl" if kind == "volume" else "AVTransport")
@@ -1637,7 +1655,8 @@ class Renderer:
                 self.stopped_revision = value
             elif kind == "volume" and self.volume == value:
                 self.volume = None
-            elif kind == "resume" and self.resume_session == value:
+            elif (kind == "resume" and self.resume_session == value
+                  and AUDIO.rejected_reconnects == fetch_rejections):
                 self.resume_session = None
                 if self.job and self.job[1] == "play" and self._current(self.job[0]):
                     self._ack_playback(self.job[0])
@@ -1646,7 +1665,9 @@ class Renderer:
                     self.job = None
                 elif stage == "uri":
                     self.job = (value, "play")
-                else:
+                elif AUDIO.rejected_reconnects == fetch_rejections:
+                    # A successful SOAP Play does not acknowledge a fetch that
+                    # we rejected while it was in flight. Keep the Play stage.
                     self._ack_playback(value)
         return True
 
@@ -2057,7 +2078,8 @@ def handle_playback_metadata(code, data, wiim, pending):
         # Enforce an expired deadline even if the maintenance tick is delayed.
         with AUDIO.lock:
             AUDIO.maintain(wiim)
-            AUDIO.resume_playback()
+            if AUDIO.resume_playback():
+                wiim.resume(AUDIO.session_id)
     elif code == "odsc":
         handle_output_description(data, wiim)
     elif code == "pbeg":
