@@ -12,11 +12,14 @@ from test_http_limits import http_server, response_headers, wait_until
 
 
 @pytest.fixture
-def playback(bridge, monkeypatch):
+def playback(bridge, monkeypatch, request):
     clock = Mock(return_value=100.0)
     monkeypatch.setattr(bridge.time, "monotonic", clock)
     renderer = bridge.Renderer("127.0.0.1")
     renderer.action = Mock(return_value=True)
+    stream_type = getattr(request, "param", "Buffered")
+    if stream_type is not None:
+        bridge.handle_playback_metadata("styp", stream_type.encode(), renderer, {})
     bridge.handle_playback_metadata("pbeg", b"", renderer, {})
     bridge.handle_output_description(b"44100/S16_LE/2", renderer)
     bridge.NOW_PLAYING.update(title="Test track", artist="Test artist")
@@ -36,17 +39,19 @@ def actions(renderer):
     return [call.args[0] for call in renderer.action.call_args_list]
 
 
-def rejected_fetch(bridge):
+def rejected_fetch(bridge, method="serve_flac"):
     handler = object.__new__(bridge.StreamHandler)
     handler.send_response = Mock()
     handler.send_header = Mock()
     handler.end_headers = Mock()
-    handler.serve_flac()
+    getattr(handler, method)()
     handler.send_response.assert_called_once_with(503)
 
 
 @pytest.mark.parametrize("duration", [.234, .372, .749])
-@pytest.mark.parametrize("resume_code", ["pres", "prsm"])
+@pytest.mark.parametrize("playback,resume_code", [
+    ("Buffered", "pres"), ("Classic", "prsm"), ("Realtime", "prsm"), (None, "prsm"),
+], indirect=["playback"])
 def test_brief_pause_preserves_stream_without_transport_commands(bridge, playback, duration, resume_code):
     renderer, clock = playback
     original = bridge.AUDIO.ring
@@ -61,6 +66,99 @@ def test_brief_pause_preserves_stream_without_transport_commands(bridge, playbac
     assert bridge.AUDIO.snapshot() is original
     assert not renderer.dispatch_once()
     assert actions(renderer) == []
+
+
+@pytest.mark.parametrize("playback", ["Buffered", None], indirect=True)
+@pytest.mark.parametrize("phase", ["startup", "flush"])
+@pytest.mark.parametrize("delay", [.1, .749, .75, 15.0])
+def test_buffering_completion_does_not_resume_authoritative_pause(bridge, playback, phase, delay):
+    renderer, clock = playback
+    if bridge.AUDIO.stream_type is None:
+        event(bridge, renderer, "pres")  # Learn support before stream metadata arrives.
+    original = bridge.AUDIO.ring
+    generation = bridge.AUDIO.playback_generation
+    event(bridge, renderer, "paus")
+    deadline = bridge.AUDIO.pause_deadline
+    if phase == "flush":
+        event(bridge, renderer, "pfls")
+    clock.return_value += delay
+    for _ in range(2):
+        event(bridge, renderer, "prsm")
+        assert bridge.AUDIO.paused
+        assert bridge.AUDIO.snapshot() is None
+        for method in ("serve_flac", "serve_wav"):
+            rejected_fetch(bridge, method)
+    assert bridge.AUDIO.playback_generation == generation
+    if delay < .75:
+        assert bridge.AUDIO.pause_deadline == deadline
+        assert not original.closed
+        assert not renderer.dispatch_once()
+    clock.return_value = 115.0
+    bridge.AUDIO.maintain(renderer)
+    assert original.closed
+    assert renderer.stop_revision == 1
+    assert renderer.dispatch_once()
+    bridge.AUDIO.feed(b"\x55" * 8)
+    event(bridge, renderer, "prsm")
+    assert bridge.AUDIO.paused
+    assert bridge.AUDIO.snapshot() is None
+    assert renderer.stop_revision == 1
+    assert not renderer.dispatch_once()
+    assert actions(renderer) == ["Stop"]
+
+    event(bridge, renderer, "pres")
+    fresh_ring = bridge.AUDIO.ring
+    assert fresh_ring is not original
+    assert bridge.AUDIO.awaiting_pcm
+    event(bridge, renderer, "prsm")
+    event(bridge, renderer, "pres")
+    assert bridge.AUDIO.ring is fresh_ring
+    fresh = b"\x03\x00\x04\x00" * 100
+    bridge.AUDIO.feed(fresh)
+    assert fresh_ring.read_from(0)[1] == fresh
+    clock.return_value += 1
+    renderer.dispatch_once()
+    renderer.dispatch_once()
+    assert actions(renderer) == ["Stop", "SetAVTransportURI", "Play"]
+
+
+@pytest.mark.parametrize("notice", ["pres", "Buffered"])
+@pytest.mark.parametrize("later_type", [None, "Classic", "Realtime"])
+def test_authoritative_resume_survives_startup_and_resets_at_session_end(
+        bridge, monkeypatch, notice, later_type):
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(bridge.time, "monotonic", clock)
+    renderer = Mock()
+    if notice == "pres":
+        event(bridge, renderer, "pres")
+    else:
+        bridge.handle_playback_metadata("styp", b"Buffered", renderer, {})
+    event(bridge, renderer, "pbeg")
+    if later_type is not None:
+        bridge.handle_playback_metadata("styp", later_type.encode(), renderer, {})
+    event(bridge, renderer, "pbeg")  # Duplicate startup must not forget the notice.
+    bridge.handle_output_description(b"44100/S16_LE/2", renderer)
+    bridge.AUDIO.feed(b"\x01\x00\x02\x00")
+    event(bridge, renderer, "paus")
+    clock.return_value += .1
+    event(bridge, renderer, "prsm")
+    assert bridge.AUDIO.paused
+    assert bridge.AUDIO.snapshot() is None
+    clock.return_value += .65
+    bridge.AUDIO.maintain(renderer)
+    renderer.stop.assert_called_once_with(bridge.AUDIO.session_id, preserve_volume=True)
+
+    event(bridge, renderer, "pend")
+    bridge.handle_playback_metadata("styp", b"Classic", renderer, {})
+    event(bridge, renderer, "pbeg")
+    bridge.handle_output_description(b"44100/S16_LE/2", renderer)
+    bridge.AUDIO.feed(b"\x03\x00\x04\x00")
+    legacy_ring = bridge.AUDIO.ring
+    event(bridge, renderer, "paus")
+    clock.return_value += .1
+    event(bridge, renderer, "prsm")
+    assert bridge.AUDIO.snapshot() is legacy_ring
+    assert not bridge.AUDIO.paused
 
 
 @pytest.mark.parametrize("duration", [.75, .751, 15.0])
@@ -282,6 +380,7 @@ def test_pause_racing_inflight_playback_does_not_play_until_resume(bridge, playb
     def action(name, *_):
         if name == stage:
             event(bridge, renderer, "paus")
+            event(bridge, renderer, "prsm")
         return True
     renderer.action.side_effect = action
     renderer.dispatch_once()
@@ -289,7 +388,7 @@ def test_pause_racing_inflight_playback_does_not_play_until_resume(bridge, playb
         renderer.dispatch_once()
     assert not renderer.dispatch_once()
     clock.return_value += .372
-    event(bridge, renderer, "prsm")
+    event(bridge, renderer, "pres")
     renderer.action.side_effect = None
     renderer.dispatch_once()
     assert actions(renderer).count("SetAVTransportURI") == 1

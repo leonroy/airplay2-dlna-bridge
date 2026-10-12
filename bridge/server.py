@@ -298,6 +298,7 @@ class AudioStream:
         self.last_pcm = self.stall_since = self.last_diagnostic = None
         self.rejected_reconnects = 0
         self.pause_fetch_rejected = False
+        self.requires_pres = False
         self.discard_alignment = 0
         self.previous_overruns = 0
 
@@ -483,6 +484,7 @@ class AudioStream:
             self.last_pcm = self.stall_since = self.last_diagnostic = None
             self.rejected_reconnects = 0
             self.pause_fetch_rejected = False
+            self.requires_pres = False
             self.discard_alignment = self.previous_overruns = 0
 
     def fail(self, reason="invalid output description"):
@@ -2035,6 +2037,8 @@ def handle_playback_metadata(code, data, wiim, pending):
                 if AUDIO.stream_type != value:
                     AUDIO.aac_bitrate_bps = None
                 AUDIO.stream_type = value
+                if value == "Buffered":
+                    AUDIO.requires_pres = True
             elif code == "sdsc" and re.fullmatch(r"(ALAC|AAC|PCM)/[0-9]{4,6}/[A-Z0-9_]+/(?:[1-8]|5\.1|7\.1)", value):
                 AUDIO._ensure_session()
                 if AUDIO.source_description != value:
@@ -2076,10 +2080,15 @@ def handle_playback_metadata(code, data, wiim, pending):
     elif code == "paus":
         AUDIO.pause()
     elif code in ("pres", "prsm"):
-        # pres precedes resumed PCM; prsm also covers receivers without pres.
-        # Enforce an expired deadline even if the maintenance tick is delayed.
         with AUDIO.lock:
+            # pres can precede pbeg/styp. Latch support until session cleanup:
+            # prsm only marks buffering completion and can follow a real pause.
+            if code == "pres":
+                AUDIO.requires_pres = True
+            # Enforce the deadline even when ignoring a buffering notification.
             AUDIO.maintain(wiim)
+            if code == "prsm" and AUDIO.requires_pres:
+                return True
             if AUDIO.resume_playback():
                 wiim.resume(AUDIO.session_id)
     elif code == "odsc":
