@@ -299,7 +299,7 @@ class AudioStream:
         self.rejected_reconnects = 0
         self.pause_fetch_rejected = False
         self.requires_pres = False
-        self.discard_alignment = 0
+        self.discard_alignment = 0  # Discarded source bytes; modulo frame size once known.
         self.previous_overruns = 0
 
     def diagnostics(self, reason, now=None):
@@ -366,10 +366,7 @@ class AudioStream:
                 if ring is not None:
                     ring.close()
                     cancel_ring_clients(ring, "sustained pause")
-                self.discarded_bytes += len(self.pending)
-                # A prior pause may still be discarding an incomplete frame.
-                self.discard_alignment = ((self.discard_alignment + len(self.pending))
-                                          % self.pcm.source_frame if self.pcm else 0)
+                self._discard_audio(len(self.pending))
                 self.pending.clear()
                 wiim.stop(self.session_id, preserve_volume=True)
                 log_timing("pause_stop", self.session_id, self.playback_generation)
@@ -520,9 +517,11 @@ class AudioStream:
                           "without pend/pbeg boundary")
                 raise ValueError("output format changed during playback; start a new session")
             self.pcm = pcm
+            self.discard_alignment %= pcm.source_frame
             self.accepting = True
             self.ring = Ring(pcm, self.session_id, self.playback_generation)
             buffered = len(self.pending)
+            self.pending[:] = self._skip_discarded_frame(self.pending)
             self._write_pending()
             delay = (f"{int((time.monotonic() - self.first_audio) * 1000)}ms after first audio"
                      if self.first_audio is not None else "before first audio")
@@ -545,15 +544,10 @@ class AudioStream:
             self._ensure_session()
             self.raw_bytes += len(data)
             if self.paused and self.pause_stopped:
-                self.discarded_bytes += len(data)
-                if self.pcm:
-                    self.discard_alignment = (self.discard_alignment + len(data)) % self.pcm.source_frame
+                self._discard_audio(len(data))
                 return
-            if self.discard_alignment and self.pcm:
-                skip = min(len(data), self.pcm.source_frame - self.discard_alignment)
-                self.discard_alignment = (self.discard_alignment + skip) % self.pcm.source_frame
-                self.discarded_bytes += skip
-                data = data[skip:]
+            if self.pcm:
+                data = self._skip_discarded_frame(data)
                 if not data:
                     return
             now = time.monotonic()
@@ -578,6 +572,21 @@ class AudioStream:
                     self.wait_logged = now
                 return
             self._write_pending()
+
+    def _discard_audio(self, count):
+        """Under self.lock: retain the byte count until odsc supplies frame size."""
+        self.discarded_bytes += count
+        self.discard_alignment += count
+        if self.pcm:
+            self.discard_alignment %= self.pcm.source_frame
+
+    def _skip_discarded_frame(self, data):
+        """Under self.lock with known PCM: finish discarding a partial source frame."""
+        if not self.discard_alignment:
+            return data
+        skip = min(len(data), self.pcm.source_frame - self.discard_alignment)
+        self._discard_audio(skip)
+        return data[skip:]
 
     def _write_pending(self):
         complete = len(self.pending) // self.pcm.source_frame * self.pcm.source_frame

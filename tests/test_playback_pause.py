@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from audio_helpers import FORMATS, samples
 from test_stream_lifecycle import stream_probe
 from test_http_limits import http_server, response_headers, wait_until
 
@@ -272,6 +273,109 @@ def test_consecutive_pauses_preserve_partial_frame_offset(bridge, offset, paused
     assert not audio.pending
     assert not audio.discard_alignment
     assert not audio.awaiting_pcm
+
+
+@pytest.mark.parametrize("format", FORMATS)
+@pytest.mark.parametrize("discarded_prefix", [1, 7])
+@pytest.mark.parametrize("description_at", ["paused", "resumed", "partial_tail", "fresh_frame"])
+def test_pause_before_description_preserves_resumed_samples(
+        bridge, monkeypatch, format, discarded_prefix, description_at):
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(bridge.time, "monotonic", clock)
+    renderer = Mock()
+    audio = bridge.AUDIO
+    source, canonical = samples(format, frames=32)
+    storage, bits = FORMATS[format]
+    source_frame, output_frame = storage * 2, bits // 8 * 2
+    boundary = (discarded_prefix + source_frame - 1) // source_frame * source_frame
+    event(bridge, renderer, "pbeg")
+    audio.feed(source[:1])
+    event(bridge, renderer, "paus")
+    clock.return_value += .75
+    audio.maintain(renderer)
+    audio.feed(source[1:discarded_prefix])  # Still no description during the pause.
+    assert audio.pcm is None
+    assert not audio.pending
+    position = discarded_prefix
+    if description_at == "paused":
+        bridge.handle_output_description(f"48000/{format}/2".encode(), renderer)
+        assert audio.snapshot() is None
+    event(bridge, renderer, "pres")
+    assert audio.awaiting_pcm
+    if description_at in ("partial_tail", "fresh_frame"):
+        position = boundary - 1 if description_at == "partial_tail" else boundary + source_frame
+        audio.feed(source[discarded_prefix:position])
+        assert audio.snapshot() is None
+    if description_at != "paused":
+        bridge.handle_output_description(f"48000/{format}/2".encode(), renderer)
+    if description_at != "fresh_frame":
+        assert audio.snapshot() is None  # An incomplete discarded frame is not fresh PCM.
+    for byte in source[position:]:
+        audio.feed(bytes([byte]))
+    expected = canonical[boundary // source_frame * output_frame:]
+    assert audio.snapshot().read_from(0)[1] == expected
+    assert audio.raw_bytes == len(source)
+    assert audio.discarded_bytes == boundary
+    assert audio.pcm_bytes == len(expected)
+    assert not audio.pending
+    assert not audio.discard_alignment
+    assert not audio.awaiting_pcm
+    renderer.stop.assert_called_once_with(audio.session_id, preserve_volume=True)
+
+
+@pytest.mark.parametrize("format", ["S16_LE", "S24_3LE", "S24_LE", "S32_BE"])
+@pytest.mark.parametrize("describe_while_paused", [False, True])
+def test_consecutive_pauses_before_description_keep_discarded_prefix(
+        bridge, monkeypatch, format, describe_while_paused):
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(bridge.time, "monotonic", clock)
+    renderer = Mock()
+    source, canonical = samples(format, frames=32)
+    audio = bridge.AUDIO
+    event(bridge, renderer, "pbeg")
+    audio.feed(source[:1])
+    event(bridge, renderer, "paus")
+    clock.return_value += .75
+    audio.maintain(renderer)
+    event(bridge, renderer, "pres")
+    audio.feed(source[1:2])  # Unknown format: resumed input remains buffered.
+    event(bridge, renderer, "paus")
+    clock.return_value += .75
+    audio.maintain(renderer)
+    audio.feed(source[2:3])
+    if describe_while_paused:
+        bridge.handle_output_description(f"48000/{format}/2".encode(), renderer)
+    event(bridge, renderer, "pres")
+    audio.feed(source[3:4])
+    if not describe_while_paused:
+        bridge.handle_output_description(f"48000/{format}/2".encode(), renderer)
+    audio.feed(source[4:])
+    storage, bits = FORMATS[format]
+    assert audio.snapshot().read_from(0)[1] == canonical[bits // 8 * 2:]
+    assert audio.discarded_bytes == storage * 2
+    assert not audio.pending
+
+
+@pytest.mark.parametrize("ending", ["pend", "rejection"])
+def test_unknown_format_discard_does_not_offset_replacement_session(bridge, ending):
+    renderer = Mock()
+    audio = bridge.AUDIO
+    event(bridge, renderer, "pbeg")
+    audio.feed(b"\x11")
+    audio.pause(now=100)
+    audio.maintain(renderer, now=100.75)
+    audio.feed(b"\x22\x33")
+    if ending == "rejection":
+        bridge.handle_output_description(b"invalid", renderer)
+        assert audio.failed
+    event(bridge, renderer, "pend")
+    event(bridge, renderer, "pbeg")
+    source, canonical = samples("S24_LE", frames=32)
+    audio.feed(source)
+    bridge.handle_output_description(b"48000/S24_LE/2", renderer)
+    assert audio.snapshot().read_from(0)[1] == canonical
+    assert not audio.discarded_bytes
+    assert not audio.pending
 
 
 @pytest.mark.parametrize("method", ["serve_flac", "serve_wav"])
