@@ -202,6 +202,19 @@ def playing_status(bridge, artwork=None, title="Once Upon a Time In the West"):
     return data
 
 
+def test_paused_status_retains_track_and_artwork(bridge_page, bridge):
+    page = bridge_page
+    data = playing_status(bridge, "/demo.svg", title="Paused track")
+    data["audio"]["state"] = "paused"
+    page.evaluate("value => window.testLogs.status(value)", data)
+    expect(page.locator("#status-text")).to_have_text("AirPlay paused")
+    expect(page.locator("#title")).to_have_text("Paused track")
+    expect(page.locator("#artwork")).to_have_attribute("src", "/demo.svg")
+    data["audio"]["state"] = "receiving"
+    page.evaluate("value => window.testLogs.status(value)", data)
+    expect(page.locator("#status-text")).to_contain_text("AirPlay 2")
+
+
 def test_artwork_waits_for_load_then_fades_and_handles_failure(bridge_page, bridge):
     page = bridge_page
     pending = []
