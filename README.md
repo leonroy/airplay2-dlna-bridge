@@ -76,7 +76,7 @@ FLAC stream sent to the recipient. Channel badges distinguish stereo (2.0), 5.1,
 and 7.1 input from stereo output. It is read-only and sends no playback or volume commands.
 
 The supplied receiver provides `ssnc/abrt` and `ssnc/arst` metadata.
-The Received row also shows the measured average AAC input bitrate. Connection details show session
+The Received row also shows the measured average AAC or ALAC input bitrate. Connection details show session
 totals for missing audio blocks, too-late blocks, and retry requests. These counters
 are receiver observations, not a general network packet-loss measurement.
 When these optional metadata messages are absent, bitrate is omitted and the

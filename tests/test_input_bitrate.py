@@ -11,23 +11,25 @@ def start_aac(bridge, rate=48000, layout="2"):
     metadata(bridge, "sdsc", f"AAC/{rate}/F24/{layout}".encode())
 
 
-@pytest.mark.parametrize("rate,samples,layout", [(48000, 96000, "2"), (44100, 88200, "2"),
-                                                (48000, 96000, "5.1"), (48000, 96000, "7.1")])
-def test_measured_average_uses_input_audio_duration(bridge, rate, samples, layout):
-    start_aac(bridge, rate, layout)
+@pytest.mark.parametrize("codec,rate,samples,layout", [
+    ("AAC", 48000, 96000, "2"), ("AAC", 44100, 88200, "2"),
+    ("AAC", 48000, 96000, "5.1"), ("AAC", 48000, 96000, "7.1"),
+    ("ALAC", 44100, 88200, "2"), ("ALAC", 48000, 96000, "2")])
+def test_measured_average_uses_input_audio_duration(bridge, codec, rate, samples, layout):
+    metadata(bridge, "sdsc", f"{codec}/{rate}/F24/{layout}".encode())
     metadata(bridge, "abrt", f"64000/{samples}/{rate}".encode())
     audio = bridge.status_snapshot()["audio"]
-    assert audio["aac_bitrate_bps"] == 256000
-    assert audio["source_format"] == f"AAC/{rate}/F24/{layout}"
+    assert audio["input_bitrate_bps"] == 256000
+    assert audio["source_format"] == f"{codec}/{rate}/F24/{layout}"
 
 
 def test_stock_receiver_and_other_codecs_have_no_measurement(bridge):
-    assert bridge.status_snapshot()["audio"]["aac_bitrate_bps"] is None
+    assert bridge.status_snapshot()["audio"]["input_bitrate_bps"] is None
     start_aac(bridge)
-    assert bridge.status_snapshot()["audio"]["aac_bitrate_bps"] is None
-    metadata(bridge, "sdsc", b"ALAC/48000/S24_LE/2")
+    assert bridge.status_snapshot()["audio"]["input_bitrate_bps"] is None
+    metadata(bridge, "sdsc", b"PCM/48000/S24_LE/2")
     metadata(bridge, "abrt", b"64000/96000/48000")
-    assert bridge.AUDIO.aac_bitrate_bps is None
+    assert bridge.AUDIO.input_bitrate_bps is None
 
 
 @pytest.mark.parametrize("payload", [
@@ -40,7 +42,7 @@ def test_invalid_measurement_does_not_replace_valid_value(bridge, payload):
     start_aac(bridge)
     metadata(bridge, "abrt", b"64000/96000/48000")
     metadata(bridge, "abrt", payload)
-    assert bridge.AUDIO.aac_bitrate_bps == 256000
+    assert bridge.AUDIO.input_bitrate_bps == 256000
 
 
 @pytest.mark.parametrize("boundary", ["reset", "pfls", "rate", "codec", "end", "fail"])
@@ -59,14 +61,27 @@ def test_measurement_resets_at_audio_boundaries(bridge, boundary):
         bridge.AUDIO.end(drain=False)
     else:
         bridge.AUDIO.fail("sample failure")
-    assert bridge.status_snapshot()["audio"]["aac_bitrate_bps"] is None
+    assert bridge.status_snapshot()["audio"]["input_bitrate_bps"] is None
 
 
 def test_duplicate_description_retains_measurement(bridge):
     start_aac(bridge)
     metadata(bridge, "abrt", b"64000/96000/48000")
     start_aac(bridge)
-    assert bridge.AUDIO.aac_bitrate_bps == 256000
+    assert bridge.AUDIO.input_bitrate_bps == 256000
+
+
+@pytest.mark.parametrize("first,second", [("AirPlay", "Classic"), ("Classic", "AirPlay")])
+def test_classic_stream_type_alias_retains_session_and_measurement(bridge, first, second):
+    metadata(bridge, "styp", first.encode())
+    metadata(bridge, "sdsc", b"ALAC/44100/S16_LE/2")
+    metadata(bridge, "abrt", b"220500/88200/44100")
+    session = bridge.AUDIO.session_id
+    metadata(bridge, "styp", second.encode())
+    audio = bridge.status_snapshot()["audio"]
+    assert audio["session"] == session
+    assert audio["stream_type"] == "Classic" and audio["airplay_version"] == 1
+    assert audio["input_bitrate_bps"] == 882000
 
 
 def test_late_measurement_cannot_reopen_ended_session(bridge):
@@ -74,7 +89,7 @@ def test_late_measurement_cannot_reopen_ended_session(bridge):
     bridge.AUDIO.end(drain=False)
     metadata(bridge, "abrt", b"64000/96000/48000")
     assert bridge.AUDIO.session_id is None
-    assert bridge.AUDIO.aac_bitrate_bps is None
+    assert bridge.AUDIO.input_bitrate_bps is None
 
 
 def test_bitrate_event_passes_real_metadata_parser(bridge):
@@ -88,7 +103,7 @@ def test_bitrate_event_passes_real_metadata_parser(bridge):
     for typ, code, payload in bridge.MetadataParser().feed(item):
         assert typ == "ssnc"
         metadata(bridge, code, payload)
-    assert bridge.AUDIO.aac_bitrate_bps == 256000
+    assert bridge.AUDIO.input_bitrate_bps == 256000
 
 
 def test_receiver_counters_are_zero_when_reported_and_unavailable_when_absent(bridge):

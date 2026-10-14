@@ -267,7 +267,7 @@ class AudioStream:
         self.ring = None
         self.pcm = None
         self.source_codec = self.stream_type = None
-        self.source_description = self.aac_bitrate_bps = None
+        self.source_description = self.input_bitrate_bps = None
         self.receiver_stats = None
         self.pending = bytearray()
         self.active = False
@@ -373,7 +373,7 @@ class AudioStream:
                 self.ring.close()
             self.ring = self.pcm = None
             self.source_codec = self.stream_type = None
-            self.source_description = self.aac_bitrate_bps = None
+            self.source_description = self.input_bitrate_bps = None
             self.receiver_stats = None
             self.pending.clear()
             self.active = self.failed = False
@@ -392,7 +392,7 @@ class AudioStream:
             self.discarded_bytes += len(self.pending)
             self.pending.clear()
             self.failed = True
-            self.aac_bitrate_bps = None
+            self.input_bitrate_bps = None
             self.receiver_stats = None
 
     def describe(self, data):
@@ -1589,7 +1589,7 @@ def status_snapshot():
         audio = {"state": state, "session": AUDIO.session_id,
                  "codec": AUDIO.source_codec, "stream_type": AUDIO.stream_type,
                  "source_format": AUDIO.source_description, "output_stream": output_stream,
-                 "aac_bitrate_bps": AUDIO.aac_bitrate_bps,
+                 "input_bitrate_bps": AUDIO.input_bitrate_bps,
                  "receiver_stats": dict(AUDIO.receiver_stats) if AUDIO.receiver_stats is not None else None,
                  "airplay_version": {"Classic": 1, "Realtime": 2, "Buffered": 2}.get(AUDIO.stream_type),
                  "age_seconds": round(now - AUDIO.started, 1) if AUDIO.started is not None else None,
@@ -1821,16 +1821,19 @@ def handle_playback_metadata(code, data, wiim, pending):
             value = data.decode("ascii")
         except UnicodeError:
             return True
+        # Classic-only receivers use "AirPlay"; AirPlay 2 builds use "Classic".
+        if code == "styp" and value == "AirPlay":
+            value = "Classic"
         with AUDIO.lock:
             if code == "styp" and value in ("Classic", "Realtime", "Buffered"):
                 AUDIO._ensure_session()
                 if AUDIO.stream_type != value:
-                    AUDIO.aac_bitrate_bps = None
+                    AUDIO.input_bitrate_bps = None
                 AUDIO.stream_type = value
             elif code == "sdsc" and re.fullmatch(r"(ALAC|AAC|PCM)/[0-9]{4,6}/[A-Z0-9_]+/(?:[1-8]|5\.1|7\.1)", value):
                 AUDIO._ensure_session()
                 if AUDIO.source_description != value:
-                    AUDIO.aac_bitrate_bps = None
+                    AUDIO.input_bitrate_bps = None
                 AUDIO.source_description = value
                 AUDIO.source_codec = value.split("/", 1)[0]
         return True
@@ -1846,25 +1849,25 @@ def handle_playback_metadata(code, data, wiim, pending):
                     ("missing_audio_blocks", "too_late_audio_blocks", "retry_requests"), counts))
         return True
     elif code == "abrt":
-        # Custom receiver counters describe compressed AAC, never decoded PCM.
+        # Receiver measurements describe compressed input, before PCM resampling.
         if not re.fullmatch(rb"[0-9]{1,20}/[0-9]{1,20}/[0-9]{1,5}", data):
             return True
         payload_bytes, samples, rate = map(int, data.split(b"/"))
         with AUDIO.lock:
             if (payload_bytes, samples, rate) == (0, 0, 0):
-                AUDIO.aac_bitrate_bps = None
-            elif (AUDIO.source_codec == "AAC" and AUDIO.session_id is not None
+                AUDIO.input_bitrate_bps = None
+            elif (AUDIO.source_codec in ("AAC", "ALAC") and AUDIO.session_id is not None
                   and AUDIO.accepting and not AUDIO.failed and rate in (44100, 48000)
                   and rate == int(AUDIO.source_description.split("/")[1])
                   and 0 < payload_bytes <= (1 << 64) - 1
                   and 2 * rate <= samples <= (1 << 64) - 1):
                 bps = (payload_bytes * 8 * rate + samples // 2) // samples
                 if 0 < bps <= 10_000_000:
-                    AUDIO.aac_bitrate_bps = bps
+                    AUDIO.input_bitrate_bps = bps
         return True
     elif code == "pfls":
         with AUDIO.lock:
-            AUDIO.aac_bitrate_bps = None
+            AUDIO.input_bitrate_bps = None
     elif code == "odsc":
         handle_output_description(data, wiim)
     elif code == "pbeg":
