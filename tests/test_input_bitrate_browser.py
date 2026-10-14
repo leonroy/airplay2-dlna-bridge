@@ -1,4 +1,4 @@
-"""Render measured AAC values using the existing isolated browser fixtures."""
+"""Render measured input values using the existing isolated browser fixtures."""
 from unittest.mock import Mock
 
 import pytest
@@ -26,14 +26,14 @@ def test_page_displays_measured_aac_in_codec_and_details(bridge_page, bridge, la
     expect(page.locator("#details")).to_contain_text("Received from AirPlay")
     expect(page.locator("#details")).to_contain_text(f"AAC · {label} · 48 kHz")
     expect(page.locator("#codec")).to_contain_text("256 kbps")
-    expect(page.locator("#details")).to_contain_text("AAC bitrate (measured average)")
+    expect(page.locator("#details")).to_contain_text("Input bitrate (measured average)")
     expect(page.locator("#details")).to_contain_text("256 kbps (measured average)")
 
 
-def test_stock_receiver_is_unavailable_and_alac_hides_bitrate(bridge_page, bridge):
+def test_stock_receiver_is_unavailable_and_pcm_hides_bitrate(bridge_page, bridge):
     page = bridge_page
     value = snapshot(bridge, measured=False)
-    value["audio"].pop("aac_bitrate_bps")
+    value["audio"].pop("input_bitrate_bps")
     value["audio"].pop("source_format")
     value["audio"].pop("output_stream")
     page.evaluate("value => window.testLogs.status(value)", value)
@@ -41,9 +41,24 @@ def test_stock_receiver_is_unavailable_and_alac_hides_bitrate(bridge_page, bridg
     expect(page.locator("#format")).to_have_text("OutputUnknown")
     expect(page.locator("#details")).to_contain_text("Unavailable")
     expect(page.locator("#codec")).not_to_contain_text("kbps")
-    page.evaluate("value => window.testLogs.status(value)", snapshot(bridge, codec="ALAC"))
-    expect(page.locator("#details")).not_to_contain_text("AAC bitrate")
+    page.evaluate("value => window.testLogs.status(value)", snapshot(bridge, codec="PCM"))
+    expect(page.locator("#details")).not_to_contain_text("Input bitrate")
     expect(page.locator("#codec")).not_to_contain_text("kbps")
+
+
+@pytest.mark.parametrize("rate,bits,payload,kbps", [
+    (44100, "S16_LE", b"220500/88200/44100", "882"),
+    (48000, "S24_LE", b"360000/96000/48000", "1440")])
+def test_page_displays_measured_alac(bridge_page, bridge, rate, bits, payload, kbps):
+    snapshot(bridge, codec="ALAC", measured=False)
+    bridge.handle_playback_metadata("sdsc", f"ALAC/{rate}/{bits}/2".encode(), Mock(), {})
+    bridge.handle_playback_metadata("abrt", payload, Mock(), {})
+    page = bridge_page
+    page.evaluate("value => window.testLogs.status(value)", bridge.status_snapshot())
+    expect(page.locator("#codec")).to_contain_text("ALAC")
+    expect(page.locator("#codec")).to_contain_text(f"{kbps} kbps")
+    expect(page.locator("#details")).to_contain_text("Input bitrate (measured average)")
+    expect(page.locator("#details")).to_contain_text(f"{kbps} kbps (measured average)")
 
 
 def test_reset_removes_old_measurement_from_page(bridge_page, bridge):

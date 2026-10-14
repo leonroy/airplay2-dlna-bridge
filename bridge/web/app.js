@@ -42,24 +42,30 @@
     if (!parts) return;
     const title = document.createElement("span"); title.className = "format-label"; title.textContent = label;
     node.append(title);
+    const values = document.createElement("span"); values.className = "format-values";
+    parts = parts.filter(Boolean);
     parts.forEach((part, index) => {
       if (index) {
         const separator = document.createElement("span"); separator.className = "format-separator";
-        separator.textContent = part ? " · " : ""; node.append(separator);
+        separator.textContent = " · "; values.append(separator);
       }
       const value = document.createElement("span"); value.textContent = part;
       if (index === 0) value.className = "format-codec";
       if (index === 1) value.className = `channel-badge${incoming ? " incoming" : ""}`;
       if (parts.length === 1) value.className = "format-unknown";
-      if (part.endsWith(" kbps")) { value.title = "Input AAC bitrate (measured average)"; value.setAttribute("aria-label", `${part}, input AAC measured average`); }
-      node.append(value);
+      if (part.endsWith(" kbps")) {
+        value.classList.add("format-bitrate"); value.title = "Input bitrate (measured average)";
+        value.setAttribute("aria-label", `${part}, input measured average`);
+      }
+      values.append(value);
     });
+    node.append(values);
   }
   const channelBadge = (channels) => channels === "2" ? "2.0" : channels === "1" ? "1.0" :
     ["5.1", "7.1"].includes(channels) ? channels : `${channels}ch`;
-  const aacBitrate = (audio) => audio.codec === "AAC" &&
-    Number.isFinite(audio.aac_bitrate_bps) && audio.aac_bitrate_bps > 0
-      ? `${Math.round(audio.aac_bitrate_bps / 1000)} kbps (measured average)` : "";
+  const inputBitrate = (audio) => ["AAC", "ALAC"].includes(audio.codec) &&
+    Number.isFinite(audio.input_bitrate_bps) && audio.input_bitrate_bps > 0
+      ? `${Math.round(audio.input_bitrate_bps / 1000)} kbps (measured average)` : "";
   const observed = (field) => field.at ? `${Math.max(0, Math.floor(Date.now() / 1000 - field.at))} seconds ago` : "Not yet observed";
   const fieldValue = (field, volume = false) => {
     if (field.error === "unavailable") return "Unavailable";
@@ -76,7 +82,7 @@
       ["Session age", duration(data.audio.age_seconds)], ["Output stream", outputFormat(data.audio.output_stream)],
       ["AirPlay version", data.audio.airplay_version ? `AirPlay ${data.audio.airplay_version}` : "Unknown"],
       ["Received from AirPlay", receivedFormat(data.audio.source_format)],
-      ...(data.audio.codec === "AAC" ? [["AAC bitrate (measured average)", aacBitrate(data.audio) || "Unavailable"]] : []),
+      ...(["AAC", "ALAC"].includes(data.audio.codec) ? [["Input bitrate (measured average)", inputBitrate(data.audio) || "Unavailable"]] : []),
       ["Missing audio blocks (session)", data.audio.receiver_stats?.missing_audio_blocks ?? "Unavailable"],
       ["Too-late audio blocks (session)", data.audio.receiver_stats?.too_late_audio_blocks ?? "Unavailable"],
       ["Retry requests (session)", data.audio.receiver_stats?.retry_requests ?? "Unavailable"],
@@ -126,7 +132,7 @@
     $("status").dataset.state = data.audio.state;
     const input = typeof data.audio.source_format === "string" && data.audio.source_format.match(/^(ALAC|AAC|PCM)\/([0-9]{4,6})\/([A-Z0-9_]+)\/([1-8]|5\.1|7\.1)$/);
     const inputBits = input && input[1] !== "AAC" && input[3].match(/^S(16|24|32)(?:_|$)/);
-    formatRow($("codec"), "Received", active ? input ? [input[1], channelBadge(input[4]), `${Number(input[2]) / 1000} kHz`, inputBits ? `${inputBits[1]}-bit` : aacBitrate(data.audio).replace(" (measured average)", "")] : ["Unknown"] : null, true);
+    formatRow($("codec"), "Received", active ? input ? [input[1], channelBadge(input[4]), `${Number(input[2]) / 1000} kHz`, inputBits ? `${inputBits[1]}-bit` : "", inputBitrate(data.audio).replace(" (measured average)", "")] : ["Unknown"] : null, true);
     const stream = data.audio.output_stream;
     formatRow($("format"), "Output", active ? stream ? [stream.codec, channelBadge(String(stream.channels)), `${stream.rate / 1000} kHz`, `${stream.bits}-bit`] : ["Unknown"] : null);
     $("volume").textContent = recipient.configured && recipient.volume.value != null && !recipient.volume.error && !recipient.volume.stale ? `Volume · ${recipient.volume.value}%` : "";
@@ -306,7 +312,7 @@
         codec: active ? "AAC" : null, airplay_version: active ? 2 : null, stream_type: active ? "Buffered" : null,
         source_format: active ? "AAC/48000/F24/5.1" : null,
         output_stream: scenario === "waiting" || !active ? null : { codec: "FLAC", rate: 48000, bits: 32, channels: 2 },
-        aac_bitrate_bps: active ? 256000 : null,
+        input_bitrate_bps: active ? 256000 : null,
         receiver_stats: active ? { missing_audio_blocks: 0, too_late_audio_blocks: 0, retry_requests: 0 } : null,
         age_seconds: active ? 84 : null, format: scenario === "waiting" || !active ? null : { rate: 48000, bits: 32, channels: 2 },
         buffered_bytes: active ? 2116800 : 0, pending_bytes: scenario === "waiting" ? 176400 : 0, raw_bytes: active ? 14817600 : 0, discarded_bytes: 0 },

@@ -36,16 +36,17 @@ h1 { font-size: clamp(25px, 5vw, 32px); line-height: 1.15; font-weight: 600; let
 .format, .volume { font-size: 10px; color: #fff6; margin: 8px 0 0; letter-spacing: .035em; }
 .volume { margin-top: 18px; }
 .audio-formats { width: max-content; margin: 18px auto 0; text-align: left; }
-.format { display: grid; grid-template-columns: 61px 35px 4px 29px 4px 46px 4px 58px; gap: 6px; align-items: center; white-space: nowrap; font-size: 11px; color: #e5e1de; margin: 0; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.format { display: grid; grid-template-columns: 61px max-content; column-gap: .55em; align-items: center; white-space: nowrap; font-size: 11px; color: #e5e1de; margin: 0; letter-spacing: 0; font-variant-numeric: tabular-nums; }
 .format:empty { display: none; }
 .format + .format:not(:empty) { margin-top: 13px; }
 .format-label { color: #ffffffa0; }
-.format-codec { font-weight: 600; }
-.format-separator { color: #ffffff70; text-align: center; }
-.format-unknown { grid-column: 2 / -1; }
+.format-values { display: flex; align-items: center; }
+.format-values > span { font: inherit; }
+.format-separator { color: #ffffff70; margin-inline: .45em; white-space: pre; text-align: center; }
+.format-bitrate { color: #b7d5c2; }
 .channel-badge { text-align: center; border: 1px solid #ffffff25; border-radius: 4px; padding: 0 3px; color: #e4e2df; }
 .channel-badge.incoming { background: #edcbb008; border-color: #edcbb040; color: #edcbb0; }
-@media (max-width: 360px) { .format { grid-template-columns: 51px 29px 3px 26px 3px 39px 3px 49px; gap: 4px; font-size: 10px; } }
+@media (max-width: 360px) { .format { grid-template-columns: 51px max-content; font-size: 10px; } }
 .issue { margin: 18px 0 0; background: #ffffff07; border: 1px solid #ffffff15; border-radius: 10px; padding: 11px 15px; font-size: 12px; color: #e3c1a5; }
 footer { text-align: center; padding: 24px; color: #fff5; font-size: 10px; letter-spacing: .05em; }
 dialog { width: min(680px, calc(100% - 32px)); max-height: 85svh; background: #242424; color: #f5f3f1; border: 1px solid #ffffff17; border-radius: 20px; padding: 24px; box-shadow: 0 30px 100px #0008; }
