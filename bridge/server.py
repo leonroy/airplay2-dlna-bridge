@@ -1821,6 +1821,9 @@ def handle_playback_metadata(code, data, wiim, pending):
             value = data.decode("ascii")
         except UnicodeError:
             return True
+        # Classic-only receivers use "AirPlay"; AirPlay 2 builds use "Classic".
+        if code == "styp" and value == "AirPlay":
+            value = "Classic"
         with AUDIO.lock:
             if code == "styp" and value in ("Classic", "Realtime", "Buffered"):
                 AUDIO._ensure_session()

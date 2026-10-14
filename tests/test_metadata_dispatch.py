@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 
-@pytest.mark.parametrize('stream_type,version', [('Classic', 1), ('Realtime', 2), ('Buffered', 2)])
+@pytest.mark.parametrize('stream_type,version', [('AirPlay', 1), ('Classic', 1), ('Realtime', 2), ('Buffered', 2)])
 @pytest.mark.parametrize('codec', ['AAC', 'ALAC', 'PCM'])
 def test_source_metadata_reports_negotiated_codec_and_protocol_and_resets(bridge, stream_type, version, codec):
     renderer = Mock()
@@ -18,6 +18,7 @@ def test_source_metadata_reports_negotiated_codec_and_protocol_and_resets(bridge
     bridge.handle_playback_metadata('pbeg', b'', renderer, pending)
     audio = bridge.status_snapshot()['audio']
     assert audio['airplay_version'] == version
+    assert audio['stream_type'] == ('Classic' if stream_type == 'AirPlay' else stream_type)
     assert audio['codec'] == codec
     assert audio['source_format'] == f'{codec}/48000/F24/2'
     bridge.handle_playback_metadata('pend', b'', renderer, pending)

@@ -71,6 +71,19 @@ def test_duplicate_description_retains_measurement(bridge):
     assert bridge.AUDIO.input_bitrate_bps == 256000
 
 
+@pytest.mark.parametrize("first,second", [("AirPlay", "Classic"), ("Classic", "AirPlay")])
+def test_classic_stream_type_alias_retains_session_and_measurement(bridge, first, second):
+    metadata(bridge, "styp", first.encode())
+    metadata(bridge, "sdsc", b"ALAC/44100/S16_LE/2")
+    metadata(bridge, "abrt", b"220500/88200/44100")
+    session = bridge.AUDIO.session_id
+    metadata(bridge, "styp", second.encode())
+    audio = bridge.status_snapshot()["audio"]
+    assert audio["session"] == session
+    assert audio["stream_type"] == "Classic" and audio["airplay_version"] == 1
+    assert audio["input_bitrate_bps"] == 882000
+
+
 def test_late_measurement_cannot_reopen_ended_session(bridge):
     start_aac(bridge)
     bridge.AUDIO.end(drain=False)
