@@ -126,7 +126,7 @@
     $("bitrate-dot").setAttribute("cx", bitrateHistory.length === 1 ? 3 : 87);
     $("bitrate-dot").setAttribute("cy", y(latest.value));
     historyButton.dataset.stale = String(age > 5);
-    historyPopover.textContent = `Min ${Math.round(low)} kbps · Max ${Math.round(high)} kbps · History ${duration((latest.at - first.at) / 1000)} · Latest ${Math.floor(age)}s ago${age > 5 ? " (old)" : ""}. Gaps mark interruptions. Latest 30 valid measured averages; retained until reload.`;
+    historyPopover.textContent = `Min ${Math.round(low)} kbps · Max ${Math.round(high)} kbps · History ${duration((latest.at - first.at) / 1000)} · Latest ${Math.floor(age)}s ago${age > 5 ? " (old)" : ""}`;
   }
   setInterval(drawHistory, 1000);
   const observed = (field) => field.at ? `${Math.max(0, Math.floor(Date.now() / 1000 - field.at))} seconds ago` : "Not yet observed";
