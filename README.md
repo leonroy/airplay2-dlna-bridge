@@ -67,7 +67,7 @@ then send AirPlay audio to this bridge as one endpoint.
 
 ## Playback status page
 
-![Playback page, connection details, and live logs](docs/status-page.gif)
+![Playback page, bitrate history, connection details, and live logs](docs/status-page.gif)
 
 The animation uses fictional track, speaker, and log data.
 The page shows artwork, track information, AirPlay version, playback state, and
@@ -76,7 +76,11 @@ FLAC stream sent to the recipient. Channel badges distinguish stereo (2.0), 5.1,
 and 7.1 input from stereo output. It is read-only and sends no playback or volume commands.
 
 The supplied receiver provides `ssnc/abrt` and `ssnc/arst` metadata.
-The Received row also shows the measured average AAC or ALAC input bitrate. Connection details show session
+The Received row also shows the measured average AAC or ALAC input bitrate.
+At widths of 600 CSS pixels or more, a small graph shows the latest 30 valid readings.
+History stays in browser memory until the page reloads. Interruptions appear as gaps.
+Tap, hover over, or focus the graph to see the bitrate range, history duration, and latest reading age.
+Connection details show session
 totals for missing audio blocks, too-late blocks, and retry requests. These counters
 are receiver observations, not a general network packet-loss measurement.
 When these optional metadata messages are absent, bitrate is omitted and the

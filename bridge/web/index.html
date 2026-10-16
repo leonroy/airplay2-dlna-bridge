@@ -29,7 +29,6 @@
     <section class="player" aria-label="Now playing">
       <div class="cover"><img id="artwork" src="/placeholder.svg" alt="No cover art"></div>
       <div class="track">
-        <p class="eyebrow">AIRPLAY / NOW PLAYING</p>
         <h1 id="title">Ready for AirPlay</h1>
         <p id="artist" class="artist">Select the bridge from your AirPlay menu.</p>
         <p id="album" class="album"></p>
@@ -38,6 +37,12 @@
         <p id="status" class="status" role="status"><span class="dot"></span><span id="status-text">Connecting to bridge…</span></p>
         <div class="audio-formats">
           <p id="codec" class="format"></p>
+          <div class="bitrate-history">
+            <button id="bitrate-history" type="button" aria-label="Bitrate history, measured average" aria-describedby="bitrate-popover" aria-expanded="false" disabled>
+              <svg viewBox="0 0 90 28" aria-hidden="true"><path id="bitrate-fill"/><path id="bitrate-line"/><circle id="bitrate-dot" r="2"/></svg>
+            </button>
+            <div id="bitrate-popover" role="tooltip" hidden>No readings yet.</div>
+          </div>
           <p id="format" class="format"></p>
         </div>
         <p id="volume" class="volume"></p>
@@ -46,7 +51,6 @@
     </section>
     <noscript><p class="noscript">Enable JavaScript to see live status.</p></noscript>
   </main>
-  <footer>AirPlay in. Music out.</footer>
   <dialog id="panel" aria-labelledby="panel-title">
     <div class="panel-heading"><h2 id="panel-title">Connection details</h2><button id="close-panel" class="icon-button" aria-label="Close panel">✕</button></div>
     <section id="details-view">
