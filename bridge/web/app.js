@@ -101,6 +101,7 @@
   function drawHistory() {
     const latest = bitrateHistory.at(-1);
     historyButton.disabled = !latest;
+    historyButton.closest(".bitrate-history").hidden = !latest;
     historyButton.dataset.count = bitrateHistory.length;
     if (!latest) return;
     const first = bitrateHistory[0], age = Math.max(0, (Date.now() - latest.at) / 1000);
@@ -179,6 +180,9 @@
       updateLogState();
     }
     const active = data.audio.state !== "idle";
+    $("status").hidden = !active;
+    document.querySelector(".audio-formats").hidden = !active;
+    if (!active) showHistory(false);
     $("title").textContent = data.track.title || (active ? "Track information unavailable" : "Ready for AirPlay");
     $("artist").textContent = data.track.artist || (active ? "AirPlay audio" : "Select the bridge from your AirPlay menu.");
     $("album").textContent = data.track.album || "";
@@ -306,6 +310,7 @@
 
   function disconnected() {
     historyGap = true;
+    $("status").hidden = false;
     $("status-text").textContent = "Bridge status unavailable · Reconnecting…";
     $("status").dataset.state = "error";
     $("volume").textContent = "";

@@ -1,4 +1,5 @@
 """Aligned stats and page-lifetime measured bitrate history."""
+from copy import deepcopy
 from datetime import datetime
 import pytest
 from test_log_browser import browser, bridge_page, expect, playing_status, log_page
@@ -43,7 +44,7 @@ def test_stats_columns_fit_and_align(bridge_page, bridge, width, source, bitrate
         outgoing = page.locator("#format .format-separator").all()
         for a, b in zip(incoming, outgoing):
             assert a.bounding_box()["x"] == b.bounding_box()["x"]
-    assert page.locator("#bitrate-history").is_visible() == (width >= 600)
+    assert page.locator("#bitrate-history").is_visible() == (width >= 600 and bitrate is not None)
 
 
 def test_history_cap_boundaries_gaps_age_and_reload(bridge_page, bridge):
@@ -148,3 +149,62 @@ def test_demo_builds_live_history_and_centres_flat_readings(bridge_page):
     expect(button).to_have_attribute("data-count", "4")
     expect(button).to_have_attribute("data-stale", "false")
     assert "L" in page.locator("#bitrate-line").get_attribute("d")
+
+
+@pytest.mark.parametrize("width", [320, 402, 599, 600, 874])
+def test_idle_and_playing_transitions_preserve_history_without_stray_graph(bridge_page, bridge, width):
+    page = bridge_page
+    page.set_viewport_size({"width": width, "height": 900})
+    button = page.locator("#bitrate-history")
+    stats = page.locator(".audio-formats")
+    expect(page.locator("#title")).to_have_text("Ready for AirPlay")
+    expect(page.locator("#status")).to_be_hidden()
+    expect(stats).to_be_hidden()
+    expect(button).to_be_hidden()
+    expect(button).to_have_attribute("data-count", "0")
+
+    playing = playing_status(bridge)
+    send(page, playing)
+    expect(stats).to_be_visible()
+    expect(page.locator("#status")).to_be_visible()
+    expect(button).to_be_hidden()
+    playing["audio"]["input_bitrate_bps"] = 256000
+    send(page, playing)
+    expect(button).to_have_attribute("data-count", "1")
+    if width >= 600:
+        button.hover()
+        expect(page.locator("#bitrate-popover")).to_be_visible()
+    idle = deepcopy(playing)
+    idle["audio"]["state"] = "idle"
+    idle["track"].update(title="", artist="", album="", artwork=None)
+    send(page, idle)
+    expect(page.locator("#title")).to_have_text("Ready for AirPlay")
+    expect(page.locator("#status")).to_be_hidden()
+    expect(stats).to_be_hidden()
+    expect(button).to_have_attribute("data-count", "1")
+    expect(page.locator("#bitrate-popover")).to_be_hidden()
+    expect(button).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#volume")).to_have_text("Volume · 25%")
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    page.mouse.move(0, 0)
+    playing["audio"]["session"] = 2
+    send(page, playing)
+    expect(stats).to_be_visible()
+    expect(page.locator("#status-text")).to_have_text("AirPlay 2 · Playing")
+    expect(button).to_have_attribute("data-count", "2")
+    assert page.locator("#bitrate-line").get_attribute("d").count("M") == 2
+    assert button.is_visible() == (width >= 600)
+    expect(page.locator("#bitrate-popover")).to_be_hidden()
+
+
+def test_idle_connection_failure_remains_visible(log_page, bridge):
+    page = log_page
+    idle = bridge.status_snapshot()
+    send(page, idle)
+    expect(page.locator("#status")).to_be_hidden()
+    page.evaluate("window.testLogs.disconnect()")
+    expect(page.locator("#status")).to_be_visible()
+    expect(page.locator("#status-text")).to_contain_text("Reconnecting")
+    page.evaluate("value => window.testLogs.reconnect(value)", idle)
+    expect(page.locator("#status")).to_be_hidden()
+    expect(page.locator(".audio-formats")).to_be_hidden()
