@@ -263,11 +263,11 @@ def test_small_windows_fit_track_metadata_and_popups(bridge_page, bridge, width,
     value = playing_status(bridge, "/demo.svg")
     value["audio"].update(source_format="AAC/48000/F24/7.1", input_bitrate_bps=256000)
     page.evaluate("value => window.testLogs.status(value)", value)
-    expect(page.locator("#codec")).to_have_text("ReceivedAAC · 7.1 · 48 kHz · 256 kbps")
+    expect(page.locator("#codec")).to_have_text("ReceivedAAC · 7.1 · 48 kHz · — · 256 kbps")
     expect(page.locator("#status-text")).to_have_text("AirPlay 2 · Playing")
     expect(page.locator("#volume")).to_have_text("Volume · 25%")
     page.wait_for_function("document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth", timeout=5000)
-    for selector in ("#title", "#artist", "#album", "#status", "#codec", "#format", "#volume", "footer"):
+    for selector in ("#title", "#artist", "#album", "#status", "#codec", "#format", "#volume"):
         rect = page.locator(selector).bounding_box()
         assert rect and rect["y"] >= 0 and rect["y"] + rect["height"] <= height
     for name in ("Connection details", "Live logs"):

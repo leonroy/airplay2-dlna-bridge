@@ -43,11 +43,12 @@
     const title = document.createElement("span"); title.className = "format-label"; title.textContent = label;
     node.append(title);
     const values = document.createElement("span"); values.className = "format-values";
-    parts = parts.filter(Boolean);
+
     parts.forEach((part, index) => {
-      if (index) {
+      if (index && part) {
         const separator = document.createElement("span"); separator.className = "format-separator";
-        separator.textContent = " · "; values.append(separator);
+        separator.textContent = " · "; separator.style.gridColumn = String(index * 2);
+        values.append(separator);
       }
       const value = document.createElement("span"); value.textContent = part;
       if (index === 0) value.className = "format-codec";
@@ -57,7 +58,9 @@
         value.classList.add("format-bitrate"); value.title = "Input bitrate (measured average)";
         value.setAttribute("aria-label", `${part}, input measured average`);
       }
-      values.append(value);
+      const cell = document.createElement("span"); cell.className = `format-cell field-${index}`;
+      cell.style.gridColumn = String(index * 2 + 1);
+      cell.append(value); values.append(cell);
     });
     node.append(values);
   }
@@ -66,6 +69,66 @@
   const inputBitrate = (audio) => ["AAC", "ALAC"].includes(audio.codec) &&
     Number.isFinite(audio.input_bitrate_bps) && audio.input_bitrate_bps > 0
       ? `${Math.round(audio.input_bitrate_bps / 1000)} kbps (measured average)` : "";
+  // History lives for this page load only; playback boundaries only break the line.
+  const bitrateHistory = [];
+  let historyGap = true, historyIdentity = null;
+  const historyButton = $("bitrate-history"), historyPopover = $("bitrate-popover");
+  function showHistory(open) {
+    historyPopover.hidden = !open;
+    historyButton.setAttribute("aria-expanded", String(open));
+  }
+  historyButton.addEventListener("click", () => showHistory(historyPopover.hidden));
+  historyButton.addEventListener("pointerenter", event => { if (event.pointerType === "mouse") showHistory(true); });
+  historyButton.addEventListener("pointerleave", event => { if (event.pointerType === "mouse") showHistory(false); });
+  historyButton.addEventListener("focus", () => { if (historyButton.matches(":focus-visible")) showHistory(true); });
+  historyButton.addEventListener("blur", () => showHistory(false));
+  document.addEventListener("pointerdown", event => { if (!event.target.closest(".bitrate-history")) showHistory(false); });
+  document.addEventListener("keydown", event => { if (event.key === "Escape") showHistory(false); });
+  function recordBitrate(data) {
+    const now = Date.now(), audio = data.audio;
+    const identity = JSON.stringify([data.instance, audio.session, audio.source_format]);
+    if (identity !== historyIdentity) historyGap = true;
+    historyIdentity = identity;
+    if (audio.state === "receiving" && inputBitrate(audio)) {
+      const previous = bitrateHistory.at(-1);
+      bitrateHistory.push({at: now, value: audio.input_bitrate_bps / 1000,
+        gap: historyGap || (previous && now - previous.at > 5000)});
+      if (bitrateHistory.length > 30) bitrateHistory.shift();
+      historyGap = false;
+    } else historyGap = true;
+    drawHistory();
+  }
+  function drawHistory() {
+    const latest = bitrateHistory.at(-1);
+    historyButton.disabled = !latest;
+    historyButton.dataset.count = bitrateHistory.length;
+    if (!latest) return;
+    const first = bitrateHistory[0], age = Math.max(0, (Date.now() - latest.at) / 1000);
+    const values = bitrateHistory.map(point => point.value);
+    const low = Math.min(...values), high = Math.max(...values);
+    const span = Math.max(1, latest.at - first.at);
+    const y = value => high === low ? 13 : 22 - (value - low) / (high - low) * 18;
+    let line = "", fill = "", segment = [];
+    const close = () => {
+      if (!segment.length) return;
+      fill += `M${segment[0][0]},26 L${segment.map(p => p.join(",")).join(" L")} L${segment.at(-1)[0]},26 Z `;
+      segment = [];
+    };
+    bitrateHistory.forEach((point, index) => {
+      const x = 3 + (point.at - first.at) / span * 84;
+      if (point.gap) close();
+      line += `${!index || point.gap ? "M" : "L"}${x},${y(point.value)} `;
+      segment.push([x, y(point.value)]);
+    });
+    close();
+    $("bitrate-line").setAttribute("d", line);
+    $("bitrate-fill").setAttribute("d", fill);
+    $("bitrate-dot").setAttribute("cx", bitrateHistory.length === 1 ? 3 : 87);
+    $("bitrate-dot").setAttribute("cy", y(latest.value));
+    historyButton.dataset.stale = String(age > 5);
+    historyPopover.textContent = `Min ${Math.round(low)} kbps · Max ${Math.round(high)} kbps · History ${duration((latest.at - first.at) / 1000)} · Latest ${Math.floor(age)}s ago${age > 5 ? " (old)" : ""}. Gaps mark interruptions. Latest 30 valid measured averages; retained until reload.`;
+  }
+  setInterval(drawHistory, 1000);
   const observed = (field) => field.at ? `${Math.max(0, Math.floor(Date.now() / 1000 - field.at))} seconds ago` : "Not yet observed";
   const fieldValue = (field, volume = false) => {
     if (field.error === "unavailable") return "Unavailable";
@@ -104,6 +167,7 @@
   }
 
   function render(data) {
+    recordBitrate(data);
     snapshot = data;
     lastStatus = Date.now();
     $("speaker-name").textContent = data.recipient.name || "AirPlay Bridge";
@@ -132,7 +196,7 @@
     $("status").dataset.state = data.audio.state;
     const input = typeof data.audio.source_format === "string" && data.audio.source_format.match(/^(ALAC|AAC|PCM)\/([0-9]{4,6})\/([A-Z0-9_]+)\/([1-8]|5\.1|7\.1)$/);
     const inputBits = input && input[1] !== "AAC" && input[3].match(/^S(16|24|32)(?:_|$)/);
-    formatRow($("codec"), "Received", active ? input ? [input[1], channelBadge(input[4]), `${Number(input[2]) / 1000} kHz`, inputBits ? `${inputBits[1]}-bit` : "", inputBitrate(data.audio).replace(" (measured average)", "")] : ["Unknown"] : null, true);
+    formatRow($("codec"), "Received", active ? input ? [input[1], channelBadge(input[4]), `${Number(input[2]) / 1000} kHz`, inputBits ? `${inputBits[1]}-bit` : "—", inputBitrate(data.audio).replace(" (measured average)", "")] : ["Unknown"] : null, true);
     const stream = data.audio.output_stream;
     formatRow($("format"), "Output", active ? stream ? [stream.codec, channelBadge(String(stream.channels)), `${stream.rate / 1000} kHz`, `${stream.bits}-bit`] : ["Unknown"] : null);
     $("volume").textContent = recipient.configured && recipient.volume.value != null && !recipient.volume.error && !recipient.volume.stale ? `Volume · ${recipient.volume.value}%` : "";
@@ -241,6 +305,7 @@
   }
 
   function disconnected() {
+    historyGap = true;
     $("status-text").textContent = "Bridge status unavailable · Reconnecting…";
     $("status").dataset.state = "error";
     $("volume").textContent = "";
@@ -322,5 +387,13 @@
       recipient: { configured: true, playback: { value: scenario === "idle" ? "STOPPED" : "PLAYING", at: now - (scenario === "failure" ? 20 : 1), error: scenario === "failure" ? "connection" : null, stale: scenario === "failure" },
         volume: { value: 38, at: now - 1, error: scenario === "failure" ? "connection" : null, stale: false } }
     });
+    if (scenario === "playing") {
+      let tick = 0;
+      setInterval(() => {
+        tick++;
+        render({...snapshot, audio: {...snapshot.audio,
+          input_bitrate_bps: Math.round(256000 + Math.sin(tick * .8) * 14000)}});
+      }, 2000);
+    }
   } else connect();
 })();
