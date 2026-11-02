@@ -20,9 +20,11 @@ def snapshot(bridge, codec="AAC", measured=True, layout="2"):
 def test_page_displays_measured_aac_in_codec_and_details(bridge_page, bridge, layout, label):
     page = bridge_page
     page.evaluate("value => window.testLogs.status(value)", snapshot(bridge, layout=layout))
-    expect(page.locator("#codec .channel-badge")).to_have_text("2.0" if layout == "2" else layout)
-    expect(page.locator("#codec")).to_contain_text("48 kHz")
-    expect(page.locator("#format")).to_have_text("OutputFLAC · 2.0 · 48 kHz · 32-bit")
+    # Stereo has no channel tag; surround adds one ahead of the codec tag.
+    assert page.locator("#tags .tag").all_text_contents() == (["AAC"] if layout == "2" else [layout, "AAC"])
+    expect(page.locator("#codec")).to_have_text(f"AAC {label} · 48 kHz · 256 kbps")
+    expect(page.locator("#format")).to_have_text("FLAC Stereo · 48 kHz · 32-bit")
+    expect(page.locator("#spec")).to_have_text("256 kbps · 48 kHz")
     expect(page.locator("#details")).to_contain_text("Received from AirPlay")
     expect(page.locator("#details")).to_contain_text(f"AAC · {label} · 48 kHz")
     expect(page.locator("#codec")).to_contain_text("256 kbps")
@@ -37,8 +39,10 @@ def test_stock_receiver_is_unavailable_and_pcm_hides_bitrate(bridge_page, bridge
     value["audio"].pop("source_format")
     value["audio"].pop("output_stream")
     page.evaluate("value => window.testLogs.status(value)", value)
-    expect(page.locator("#codec")).to_contain_text("Unknown")
-    expect(page.locator("#format")).to_have_text("OutputUnknown")
+    expect(page.locator("#codec")).to_have_text("Unknown")
+    expect(page.locator("#format")).to_have_text("Unknown")
+    expect(page.locator("#tags .tag")).to_have_count(0)
+    expect(page.locator("#spec")).to_have_text("Unknown format")
     expect(page.locator("#details")).to_contain_text("Unavailable")
     expect(page.locator("#codec")).not_to_contain_text("kbps")
     page.evaluate("value => window.testLogs.status(value)", snapshot(bridge, codec="PCM"))
@@ -56,7 +60,10 @@ def test_page_displays_measured_alac(bridge_page, bridge, rate, bits, payload, k
     page = bridge_page
     page.evaluate("value => window.testLogs.status(value)", bridge.status_snapshot())
     expect(page.locator("#codec")).to_contain_text("ALAC")
-    expect(page.locator("#codec")).to_contain_text(f"{kbps} kbps")
+    # Lossless input shows its bit depth in the path; the bitrate is the chart's headline.
+    expect(page.locator("#codec")).to_contain_text(f"{rate / 1000:g} kHz · {16 if rate == 44100 else 24}-bit")
+    expect(page.locator("#codec")).not_to_contain_text("kbps")
+    expect(page.locator("#bitrate-now")).to_have_text(kbps)
     expect(page.locator("#details")).to_contain_text("Input bitrate (measured average)")
     expect(page.locator("#details")).to_contain_text(f"{kbps} kbps (measured average)")
 

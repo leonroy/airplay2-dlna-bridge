@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#161616">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0a0e">
   <title>AirPlay Bridge</title>
   <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64 128x128 256x256">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" sizes="any">
@@ -13,60 +13,85 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <div class="ambience" aria-hidden="true"><img id="backdrop" class="visible" src="/placeholder.svg" alt=""><img id="backdrop-next" src="/placeholder.svg" alt=""></div>
-  <header>
-    <a id="speaker-name" class="brand" href="/">AirPlay Bridge</a>
+  <main class="stage" id="stage" aria-label="AirPlay Bridge">
+    <div class="visual" id="visual"></div>
+    <div class="covers" id="covers"></div>
+    <div class="beat-light" id="beat-light"></div>
+    <div class="floor"></div>
+    <div class="grain"></div>
     <span id="demo-label" class="demo-label" hidden>Demo</span>
-    <button id="menu-button" class="icon-button" aria-label="Open menu" aria-expanded="false" aria-controls="menu">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/></svg>
-    </button>
-    <nav id="menu" aria-label="Page menu" hidden>
-      <button data-panel="details">Connection details</button>
-      <button data-panel="logs">Live logs</button>
-    </nav>
-  </header>
-  <main>
-    <section class="player" aria-label="Now playing">
-      <div class="cover"><img id="artwork" src="/placeholder.svg" alt="No cover art"></div>
-      <div class="track">
-        <h1 id="title">Ready for AirPlay</h1>
-        <p id="artist" class="artist">Select the bridge from your AirPlay menu.</p>
-        <p id="album" class="album"></p>
-      </div>
-      <div class="playback-info">
-        <p id="status" class="status" role="status"><span class="dot"></span><span id="status-text">Connecting to bridge…</span></p>
-        <div class="audio-formats">
-          <p id="codec" class="format"></p>
-          <div class="bitrate-history" hidden>
-            <button id="bitrate-history" type="button" aria-label="Bitrate history, measured average" aria-describedby="bitrate-popover" aria-expanded="false" disabled>
-              <svg viewBox="0 0 90 28" aria-hidden="true"><path id="bitrate-fill"/><path id="bitrate-line"/><circle id="bitrate-dot" r="2"/></svg>
-            </button>
-            <div id="bitrate-popover" role="tooltip" hidden>No readings yet.</div>
-          </div>
-          <p id="format" class="format"></p>
+    <div class="lockup">
+      <div class="copy">
+        <button id="tags" class="tags" type="button" data-panel="audio" aria-label="Audio quality. Show details." hidden><span id="spec" class="spec"></span></button>
+        <div id="head">
+          <p id="eyebrow" class="eyebrow" hidden><span class="dot"></span><span></span></p>
+          <h1 id="title">Connecting to bridge…</h1>
+          <p class="by" hidden><span id="artist"></span> <span id="album"></span></p>
+          <p id="note" class="note" hidden></p>
         </div>
-        <p id="volume" class="volume"></p>
       </div>
-      <button id="issue" class="issue" hidden></button>
-    </section>
+      <div class="room" id="room">
+        <span class="eq off" id="eq" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span id="room-label"></span>
+        <span class="vol off" id="vol" hidden><span class="level" role="img" aria-label="Speaker volume"><i></i></span><span class="vol-num" id="volume"></span></span>
+        <button class="more" id="more" type="button" data-panel="details" aria-label="Show details"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5.5" cy="12" r="1.8"></circle><circle cx="12" cy="12" r="1.8"></circle><circle cx="18.5" cy="12" r="1.8"></circle></svg></button>
+      </div>
+    </div>
+    <aside id="panel" class="panel" aria-label="Audio and connection" hidden>
+      <div class="panel-head">
+        <div class="seg">
+          <span class="pill"></span>
+          <button type="button" data-panel="audio" aria-pressed="false">Audio</button>
+          <button type="button" data-panel="details" aria-pressed="false">Connection</button>
+          <button type="button" data-panel="logs" aria-pressed="false">Logs</button>
+        </div>
+        <button class="more" id="close-panel" type="button" aria-label="Close panel"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="m5 5 14 14M19 5 5 19"></path></svg></button>
+      </div>
+      <div class="panel-body">
+        <section id="audio-view" hidden>
+          <h2 id="quality-title" data-s></h2>
+          <p id="quality-copy" class="q-copy" data-s></p>
+          <ol class="path" id="path" data-s>
+            <li><span class="node"></span><span class="wire"></span><small>Received from AirPlay</small><div class="value" id="codec"></div></li>
+            <li><span class="node"></span><span class="wire"></span><small>Sent by the bridge</small><div class="value" id="format"></div></li>
+            <li id="path-room-row"><span class="node"></span><small>Speaker</small><div class="value" id="path-room"><b></b> <span></span></div></li>
+          </ol>
+          <div class="chart-stats" id="audio-stats" data-s hidden>
+              <div id="bitrate-stat" hidden><p class="stat-label">Input bitrate</p><p class="stat-value"><b id="bitrate-now"></b><small>kbps</small></p></div>
+              <div id="tempo-stat" hidden><p class="stat-label">Tempo</p><p class="stat-value"><b id="tempo-now"></b><small>BPM</small><span class="beat-mark" id="beat-mark" aria-hidden="true"></span></p></div>
+          </div>
+          <div class="chart" id="bitrate-chart" data-s hidden>
+            <div class="trace">
+              <svg id="bitrate-history" viewBox="0 0 100 56" preserveAspectRatio="none" role="img" aria-label="Input bitrate over the last 60 seconds" data-count="0" data-stale="false"><g id="bitrate-glide"><path id="bitrate-line" d="" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></path></g></svg>
+              <span class="trace-dot" id="trace-dot" aria-hidden="true"></span>
+            </div>
+            <p class="chart-foot" id="bitrate-foot"></p>
+          </div>
+        </section>
+        <section id="details-view" hidden>
+          <div id="details" class="rows"></div>
+          <p class="fine" data-s>Endpoint status reflects received audio. It does not confirm AirPlay discovery.</p>
+        </section>
+        <section id="logs-view" hidden>
+          <div class="log-tools">
+            <input class="log-filter" id="log-filter" type="search" placeholder="Filter logs" aria-label="Filter logs" autocomplete="off" spellcheck="false">
+            <button class="log-tool" id="log-issues" type="button" aria-pressed="false">Issues 0</button>
+            <button class="log-tool" id="log-copy" type="button">Copy</button>
+          </div>
+          <div class="log-wrap">
+            <pre class="log" id="log-output" tabindex="0" aria-label="Recent bridge log messages"></pre>
+            <p class="log-empty" id="log-empty" hidden>No matching log lines.</p>
+            <button class="new-logs" id="new-logs" type="button" hidden>0 new ↓</button>
+          </div>
+          <div class="log-foot">
+            <span><span class="log-state" id="log-state">Connecting…</span> · <span id="log-count">0 lines</span></span>
+            <span>Recent messages from this bridge process. History resets when it restarts. Shairport Sync and other Docker output are not included.</span>
+          </div>
+        </section>
+      </div>
+    </aside>
+    <p class="sr" id="live" role="status"></p>
     <noscript><p class="noscript">Enable JavaScript to see live status.</p></noscript>
   </main>
-  <dialog id="panel" aria-labelledby="panel-title">
-    <div class="panel-heading"><h2 id="panel-title">Connection details</h2><button id="close-panel" class="icon-button" aria-label="Close panel">✕</button></div>
-    <section id="details-view">
-      <p class="panel-intro">Live observations from the bridge and recipient.</p>
-      <dl id="details"></dl>
-      <p class="fine-print">Endpoint status reflects received audio. It does not confirm AirPlay discovery.</p>
-    </section>
-    <section id="logs-view" hidden>
-      <p class="panel-intro">Bridge application logs</p>
-      <div class="log-toolbar"><span id="log-state">Connecting…</span></div>
-      <div class="log-area">
-        <pre id="log-output" tabindex="0" aria-label="Recent bridge log messages"></pre>
-        <button id="new-logs" class="new-logs" hidden>0 new ↓</button>
-      </div>
-      <p class="fine-print">Recent messages from this bridge process. History resets when it restarts. Shairport Sync and other Docker output are not included.</p>
-    </section>
-  </dialog>
 </body>
 </html>

@@ -9,7 +9,7 @@
 - the shairport metadata pipe drives UPnP Play/Stop, hardware volume, and
   now-playing DIDL pushes on the renderer
 """
-import base64, collections, hashlib, json, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
+import base64, collections, hashlib, json, math, os, plistlib, re, select, socket, struct, subprocess, threading, time, http.client, ipaddress, urllib.parse
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
@@ -26,6 +26,8 @@ HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", "16"))
 FLAC_MAX_ENCODERS = int(os.environ.get("FLAC_MAX_ENCODERS", "4"))
 HTTP_HEADER_TIMEOUT = int(os.environ.get("HTTP_HEADER_TIMEOUT", "5"))
 HTTP_HEADER_DEADLINE = int(os.environ.get("HTTP_HEADER_DEADLINE", "10"))
+# The bridge hears audio before the speaker plays it; the page pulses this late.
+PULSE_DELAY = int(os.environ.get("PULSE_DELAY_MS", "5000")) / 1000
 if min(HTTP_MAX_CONNECTIONS, FLAC_MAX_ENCODERS,
        HTTP_HEADER_TIMEOUT, HTTP_HEADER_DEADLINE) <= 0:
     raise ValueError("HTTP/encoder limits and header timeouts must be positive integers")
@@ -178,6 +180,154 @@ class PCMFormat(collections.namedtuple("PCMFormatBase", "rate format channels"))
                 + b"data" + struct.pack("<I", 0xFFFFFFFF))
 
 
+class BeatTracker:
+    """Estimate tempo, beat position and loudness from PCM, using only the standard library.
+
+    Audio is thinned to a few kHz first: this runs on the feed path and must stay cheap.
+    """
+    HOP_RATE = 86
+    WINDOW_SECONDS = 10
+    MIN_SECONDS = 5
+    MIN_BPM, MAX_BPM = 70, 180
+    MIN_CONFIDENCE = 0.12
+    SILENCE = 0.002
+    MAX_GAP_SECONDS = 1.0
+
+    def __init__(self, pcm):
+        self.channels = pcm.channels
+        self.width = pcm.bits // 8
+        self.frame = pcm.frame
+        self.rate = pcm.rate
+        self.hop_frames = max(1, pcm.rate // self.HOP_RATE)
+        self.hop_seconds = self.hop_frames / pcm.rate
+        self.hop_bytes = self.hop_frames * self.frame
+        self.stride = max(2, pcm.rate // 4000)
+        if self.width > 1 and self.stride * self.frame % 2:
+            # Samples are read as 16-bit values, so the step must be a whole number of them.
+            self.stride += 1
+        self.partial = bytearray()
+        self.onsets = collections.deque(maxlen=int(self.WINDOW_SECONDS / self.hop_seconds))
+        self.floor = self.loudness = self.peak = 0.0
+        self.hops = 0
+        self.fed_at = None
+        self.period = self.beat_hop = None
+        self.confidence = 0.0
+
+    def _level(self, block):
+        total = count = 0
+        for channel in range(self.channels):
+            if self.width == 1:
+                values = [value - 128 for value in block[channel::self.stride * self.frame]]
+                scale = 128
+            else:
+                # The top 16 bits of each little-endian sample are enough for an envelope.
+                start = channel * self.width + self.width - 2
+                view = memoryview(block)[start:]
+                view = view[:len(view) // 2 * 2].cast("h")
+                values = view[::self.stride * self.frame // 2]
+                scale = 32768
+            total += sum(map(abs, values)) / scale
+            count += len(values)
+        return total / count if count else 0.0
+
+    def feed(self, data):
+        if self.fed_at is not None and time.monotonic() - self.fed_at > self.MAX_GAP_SECONDS:
+            # After a gap, the old rhythm says nothing about the audio that follows.
+            self.onsets.clear()
+            self.period = self.beat_hop = None
+            self.confidence = 0.0
+        self.partial.extend(data)
+        offset = 0
+        while len(self.partial) - offset >= self.hop_bytes:
+            self._hop(self.partial[offset:offset + self.hop_bytes])
+            offset += self.hop_bytes
+        del self.partial[:offset]
+        self.fed_at = time.monotonic()
+
+    def _hop(self, block):
+        level = self._level(block)
+        compressed = math.log1p(200 * level)
+        self.onsets.append(max(0.0, compressed - self.floor))
+        self.floor += (compressed - self.floor) * 0.25
+        self.loudness += (level - self.loudness) * 0.02
+        self.peak = max(level, self.peak * 0.9998)
+        self.hops += 1
+        if self.hops % self.HOP_RATE == 0:
+            self._estimate()
+
+    def _estimate(self):
+        onsets = list(self.onsets)
+        if len(onsets) * self.hop_seconds < self.MIN_SECONDS or self.loudness < self.SILENCE:
+            self.period = self.beat_hop = None
+            self.confidence = 0.0
+            return
+        mean = sum(onsets) / len(onsets)
+        values = [value - mean for value in onsets]
+        power = sum(value * value for value in values)
+        if not power:
+            self.period = self.beat_hop = None
+            self.confidence = 0.0
+            return
+        low = int(60 / self.MAX_BPM / self.hop_seconds)
+        high = int(60 / self.MIN_BPM / self.hop_seconds) + 1
+        correlation = {}
+
+        def lag_score(lag):
+            if lag not in correlation:
+                correlation[lag] = (sum(map(float.__mul__, values, values[lag:])) / (len(values) - lag)
+                                    if lag < len(values) else 0.0)
+            return correlation[lag]
+
+        best_lag, best = None, 0.0
+        for lag in range(low, high + 1):
+            # Listeners favour a tempo near 120 BPM, which settles half and double-time ties.
+            bpm = 60 / (lag * self.hop_seconds)
+            preference = math.exp(-0.5 * (math.log2(bpm / 120) / 0.9) ** 2)
+            score = (lag_score(lag) + 0.5 * lag_score(lag * 2) + 0.25 * lag_score(lag // 2)) * preference
+            if score > best:
+                best_lag, best = lag, score
+        if best_lag is None:
+            self.period = self.beat_hop = None
+            self.confidence = 0.0
+            return
+        before, here, after = lag_score(best_lag - 1), lag_score(best_lag), lag_score(best_lag + 1)
+        curve = before - 2 * here + after
+        period = best_lag + (0.5 * (before - after) / curve if curve < 0 else 0)
+        if self.period and abs(period - self.period) / self.period < 0.03:
+            period = self.period + (period - self.period) * 0.25
+        self.period = period
+        self.confidence = min(1.0, max(0.0, here * len(values) / power))
+        self.beat_hop = self._beat_position(onsets, period)
+
+    def _beat_position(self, onsets, period):
+        last = len(onsets) - 1
+        best_phase, best = 0, -1.0
+        for phase in range(int(period) + 1):
+            score, weight = 0.0, 1.0
+            index = last - phase
+            while index >= 0:
+                score += onsets[int(index)] * weight
+                weight *= 0.9
+                index -= period
+            if score > best:
+                best_phase, best = phase, score
+        return self.hops - 1 - best_phase
+
+    def snapshot(self, now=None, delay=0.0):
+        if self.period is None or self.confidence < self.MIN_CONFIDENCE or self.fed_at is None:
+            return None
+        now = time.monotonic() if now is None else now
+        # The speaker keeps playing buffered audio for the delay after the last PCM arrives.
+        if now - self.fed_at > self.MAX_GAP_SECONDS + delay:
+            return None
+        position = self.hops + (now - self.fed_at) / self.hop_seconds
+        next_beat = ((self.beat_hop + delay / self.hop_seconds) - position) % self.period
+        return {"bpm": round(60 / (self.period * self.hop_seconds), 1),
+                "confidence": round(self.confidence, 2),
+                "next_beat_in": round(next_beat * self.hop_seconds, 3),
+                "level": round(min(1.0, self.loudness / self.peak) if self.peak else 0.0, 2)}
+
+
 class StreamEnded(Exception):
     """A reader must reconnect rather than consume a different session's PCM."""
 
@@ -265,6 +415,7 @@ class AudioStream:
     def __init__(self):
         self.lock = threading.RLock()
         self.ring = None
+        self.beat = None
         self.pcm = None
         self.source_codec = self.stream_type = None
         self.source_description = self.input_bitrate_bps = None
@@ -371,7 +522,7 @@ class AudioStream:
             log(f"session ended reason={reason}; {self.status()}")
             if self.ring is not None:
                 self.ring.close()
-            self.ring = self.pcm = None
+            self.ring = self.pcm = self.beat = None
             self.source_codec = self.stream_type = None
             self.source_description = self.input_bitrate_bps = None
             self.receiver_stats = None
@@ -388,7 +539,7 @@ class AudioStream:
                 log(f"audio session rejected reason={reason}; {self.status()}")
             if self.ring is not None:
                 self.ring.close()
-            self.ring = self.pcm = None
+            self.ring = self.pcm = self.beat = None
             self.discarded_bytes += len(self.pending)
             self.pending.clear()
             self.failed = True
@@ -414,6 +565,7 @@ class AudioStream:
             self.pcm = pcm
             self.accepting = True
             self.ring = Ring(pcm, self.session_id)
+            self.beat = BeatTracker(pcm)
             buffered = len(self.pending)
             self._write_pending()
             delay = (f"{int((time.monotonic() - self.first_audio) * 1000)}ms after first audio"
@@ -459,6 +611,12 @@ class AudioStream:
             normalised = self.pcm.normalise(bytes(self.pending[:complete]))
             self.ring.write(normalised)
             self.pcm_bytes += len(normalised)
+            try:
+                self.beat.feed(normalised)
+            except Exception as error:
+                # Decoration must never interrupt the audio path.
+                log(f"beat analysis stopped: {error}")
+                self.beat = None
             del self.pending[:complete]
 
     def snapshot(self):
@@ -1593,6 +1751,7 @@ def status_snapshot():
                  "receiver_stats": dict(AUDIO.receiver_stats) if AUDIO.receiver_stats is not None else None,
                  "airplay_version": {"Classic": 1, "Realtime": 2, "Buffered": 2}.get(AUDIO.stream_type),
                  "age_seconds": round(now - AUDIO.started, 1) if AUDIO.started is not None else None,
+                 "pulse": AUDIO.beat.snapshot(now, delay=PULSE_DELAY) if AUDIO.beat else None,
                  "format": pcm, "pending_bytes": len(AUDIO.pending), "buffered_bytes": 0,
                  "raw_bytes": AUDIO.raw_bytes, "discarded_bytes": AUDIO.discarded_bytes}
         if AUDIO.ring is not None:
