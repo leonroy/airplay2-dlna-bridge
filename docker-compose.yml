@@ -47,6 +47,8 @@ services:
       # push track title/artist/album/artwork to the renderer's display on track change
       # (the player restarts the stream on each push: ~2-4s gap per track; 0 = off)
       - DIDL_PUSH=${DIDL_PUSH:-1}
+      # delay in milliseconds between received audio and the speaker, for aligning the status page pulse
+      - PULSE_DELAY_MS=${PULSE_DELAY_MS:-5000}
     volumes:
       - shared:/shared
 

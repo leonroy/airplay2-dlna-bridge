@@ -70,25 +70,38 @@ then send AirPlay audio to this bridge as one endpoint.
 ![Playback page, bitrate history, connection details, and live logs](docs/status-page.gif)
 
 The animation uses fictional track, speaker, and log data.
-The page shows artwork, track information, AirPlay version, playback state, and
-volume. Separate Received and Output rows show the incoming audio format and the
-FLAC stream sent to the recipient. Channel badges distinguish stereo (2.0), 5.1,
-and 7.1 input from stereo output. It is read-only and sends no playback or volume commands.
+The page shows album artwork on a color field taken from the cover, with track
+information, the AirPlay version, playback state, and volume. Quality tags
+describe the audio the sender delivered: Lossless, Hi-Res Lossless, or AAC, with
+5.1 and 7.1 tags for multichannel input. They do not describe the FLAC output
+sent to the speaker.
+
+Select the tag or the “…” button to open a panel with three tabs:
+
+- **Audio** shows the route, the measured bitrate history, and the detected tempo.
+- **Connection** shows all session counters.
+- **Logs** shows live bridge logs. It follows new entries until you scroll up.
+  Select the new-entry button to resume following. Use the filter to narrow the
+  list, the Issues toggle to limit it to issues, and Copy to copy the entries.
 
 The supplied receiver provides `ssnc/abrt` and `ssnc/arst` metadata.
-The Received row also shows the measured average AAC or ALAC input bitrate.
-At widths of 600 CSS pixels or more, a small graph shows the latest 30 valid readings.
+The Audio tab shows the measured average AAC or ALAC input bitrate.
+A small graph shows the latest 30 valid readings, with the bitrate range, history duration, and latest reading age below it.
 History stays in browser memory until the page reloads. Interruptions appear as gaps.
-Tap, hover over, or focus the graph to see the bitrate range, history duration, and latest reading age.
-Connection details show session
-totals for missing audio blocks, too-late blocks, and retry requests. These counters
-are receiver observations, not a general network packet-loss measurement.
-When these optional metadata messages are absent, bitrate is omitted and the
-counters appear as unavailable.
+The Connection tab shows session totals for missing audio blocks, too-late
+blocks, and retry requests. These counters are receiver observations, not a
+general network packet-loss measurement. When these optional metadata messages
+are absent, bitrate is omitted and the counters appear as unavailable.
 
-Open the menu for connection details or live bridge logs. Logs follow new entries
-until you scroll up. Select the new-entry button to resume following.
-Press Escape to close a popup. The page respects reduced-motion preferences.
+The bridge analyzes received audio locally to estimate tempo, beat position, and
+loudness. The color field and waveform bars follow that estimate. Nothing is sent
+anywhere, and no API key is required. The estimate needs about five seconds to
+lock on. It stays still for silence or for audio without a clear beat, and very
+fast music can settle at half-time.
+
+During playback, the controls fade when the page is idle and return when you move
+the pointer or press a key. Escape closes the panel. The page respects reduced-motion
+preferences. It is read-only and sends no playback or volume commands.
 
 Status updates arrive every two seconds. Speaker observations refresh about
 five seconds after each completed query and appear stale after 15 seconds.
@@ -115,6 +128,7 @@ The main settings are:
 | `AIRPLAY_NAME` | `AirPlay 1 Bridge` or `AirPlay 2 Bridge` | Name shown in the sender's AirPlay menu, according to the selected version. |
 | `MAX_VOLUME` | `100` | Speaker volume when the sender is at full volume, on a 0–100 scale. |
 | `DIDL_PUSH` | `1` | Refresh track information on the speaker display. See [Playback behavior](#playback-behavior). |
+| `PULSE_DELAY_MS` | `5000` | Delay between received audio and playback. The status page pulse is shifted by this amount to line up with the music. |
 | `STREAM_PORT` | `8000` | Host port for audio, artwork, and the status page. |
 | `BRIDGE_IMAGE_TAG` | `latest` | Published bridge version. Release tags omit the leading `v`. |
 

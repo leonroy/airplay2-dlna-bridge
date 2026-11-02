@@ -1,6 +1,7 @@
 """Exercise the playback and log UI with synthetic events and an isolated browser."""
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -101,10 +102,41 @@ def bridge_page(browser, bridge):
 @pytest.fixture
 def log_page(bridge_page):
     page = bridge_page
-    page.get_by_role("button", name="Open menu").click()
-    page.get_by_role("button", name="Live logs", exact=True).click()
+    open_panel(page, "Logs")
     expect(page.locator("#log-state")).to_have_text("Live")
     yield page
+
+
+def send(page, data):
+    page.evaluate("value => window.testLogs.status(value)", data)
+
+
+def open_panel(page, tab="Connection"):
+    """Open the closed panel with the speaker-capsule button, then pick a tab."""
+    page.get_by_role("button", name="Show details", exact=True).click()
+    # The panel opens on Connection; the other tabs are one click away.
+    if tab != "Connection":
+        page.locator(".seg").get_by_role("button", name=tab, exact=True).click()
+
+
+def close_panel(page):
+    page.get_by_role("button", name="Close panel").click()
+    expect(page.locator("#panel")).to_be_hidden()
+
+
+# Every finite animation or transition has ended (looping ones never do).
+SETTLED = """() => document.getAnimations().every(animation => {
+  const timing = animation.effect && animation.effect.getComputedTiming();
+  return !timing || timing.endTime === Infinity || !['running', 'pending'].includes(animation.playState);
+})"""
+
+
+def settled(page):
+    page.wait_for_function(SETTLED, timeout=10000)
+
+
+def next_frames(page, count=3):
+    page.evaluate("count => new Promise(done => { const tick = () => --count > 0 ? requestAnimationFrame(tick) : done(); tick(); })", count)
 
 
 def emit(page, start, count):
@@ -137,7 +169,7 @@ def test_live_logs_preserve_reading_position_and_resume_via_badge(log_page):
     page.mouse.wheel(0, -500)
     page.wait_for_function("document.querySelector('#log-output').scrollHeight - document.querySelector('#log-output').clientHeight - document.querySelector('#log-output').scrollTop > 8")
     before = anchor(page)
-    expect(page.locator("#log-state")).not_to_have_class("log-pulse")
+    expect(page.locator("#log-state")).not_to_have_class(re.compile(r"\blog-pulse\b"))
 
     # The oldest entries expire, but the reader's retained entry stays in place.
     emit(page, 501, 20)
@@ -183,7 +215,7 @@ def test_live_indicator_pulses_without_entries_and_respects_reduced_motion(log_p
     page.wait_for_function("document.querySelector('#log-state').getAnimations()[0].currentTime > 200")
     page.emulate_media(reduced_motion="reduce")
     assert state.evaluate("node => getComputedStyle(node).animationName") == "none"
-    assert state.evaluate("node => getComputedStyle(node).color") == "rgb(224, 160, 154)"
+    assert state.evaluate("node => getComputedStyle(node).color") == "rgb(255, 255, 255)"
     page.evaluate("window.testLogs.disconnect()")
     expect(state).to_have_text("Reconnecting…")
     assert state.evaluate("node => getComputedStyle(node).animationName") == "none"
@@ -202,43 +234,61 @@ def playing_status(bridge, artwork=None, title="Once Upon a Time In the West"):
     return data
 
 
-def test_artwork_waits_for_load_then_fades_and_handles_failure(bridge_page, bridge):
+def test_artwork_waits_for_load_then_swaps_and_handles_failure(bridge_page, bridge):
     page = bridge_page
     pending = []
     page.route(f"**{ART_ONE}", lambda route: pending.append(route))
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, ART_ONE))
-    page.wait_for_function("path => document.querySelector('#artwork').getAttribute('src') === path", arg=ART_ONE)
+    with page.expect_request(lambda request: request.url.endswith(ART_ONE)):
+        send(page, playing_status(bridge, ART_ONE))
+    # The cover only appears once the new image has loaded.
+    expect(page.locator("#title")).to_have_text("Once Upon a Time In the West")
+    next_frames(page)
     assert pending
-    expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/placeholder.svg")
+    expect(page.locator("#artwork")).to_have_count(0)
     for route in pending:
         route.fulfill(body='<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><path fill="red" d="M0 0h8v8H0z"/></svg>', content_type="image/svg+xml")
-    expect(page.locator(".ambience img.visible")).to_have_attribute("src", ART_ONE)
-    page.wait_for_function("(() => { const opacity = Number(getComputedStyle(document.querySelector('.ambience img.visible')).opacity); return opacity > 0 && opacity < .3; })()")
-    page.wait_for_function("getComputedStyle(document.querySelector('.ambience img.visible')).opacity === '0.3'")
-    page.route(f"**{ART_TWO}", lambda route: route.fulfill(status=404))
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, ART_TWO))
-    expect(page.locator("#artwork")).to_have_attribute("src", "/placeholder.svg")
-    expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/placeholder.svg")
-    expect(page.locator("#artwork")).to_have_attribute("alt", "No cover art")
+    expect(page.locator("#artwork")).to_have_attribute("src", ART_ONE)
+    expect(page.locator("#artwork")).to_have_attribute("alt", "Cover art for Example Album")
+    expect(page.locator("#covers .hero")).to_have_count(1)
+
+    # While the next cover loads, the previous one stays on show.
+    second = []
+    page.route(f"**{ART_TWO}", lambda route: second.append(route))
+    with page.expect_request(lambda request: request.url.endswith(ART_TWO)):
+        send(page, playing_status(bridge, ART_TWO))
+    next_frames(page)
+    assert second
+    expect(page.locator("#artwork")).to_have_attribute("src", ART_ONE)
+    # A cover that fails to load is treated as no artwork, and is not a page error.
+    for route in second:
+        route.fulfill(status=404)
+    expect(page.locator("#artwork")).to_have_count(0)
+    expect(page.locator("#covers .hero")).to_have_count(0)
+
+    # Reduced motion swaps covers without leaving any animation behind.
     page.emulate_media(reduced_motion="reduce")
-    assert page.locator(".ambience img.visible").evaluate("node => getComputedStyle(node).transitionDuration") == "0s"
+    send(page, playing_status(bridge, ART_ONE, "Another track"))
+    expect(page.locator("#artwork")).to_have_attribute("src", ART_ONE)
+    page.wait_for_function("document.getAnimations().length === 0")
 
 
 def test_late_artwork_cannot_replace_a_newer_track(bridge_page, bridge):
     page = bridge_page
     pending = []
     page.route(f"**{ART_ONE}", lambda route: pending.append(route))
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, ART_ONE, "Old track"))
-    page.wait_for_function("path => document.querySelector('#artwork').getAttribute('src') === path", arg=ART_ONE)
+    with page.expect_request(lambda request: request.url.endswith(ART_ONE)):
+        send(page, playing_status(bridge, ART_ONE, "Old track"))
+    next_frames(page)
     assert pending
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, "/demo.svg", "New track"))
-    expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/demo.svg")
-    for route in pending:
-        route.fulfill(body=(Path(__file__).parents[1] / "bridge/web/demo.svg").read_bytes(), content_type="image/svg+xml")
-    # Let the old response and the entire fade finish before checking the final result.
-    page.wait_for_timeout(550)
-    expect(page.locator(".ambience img.visible")).to_have_attribute("src", "/demo.svg")
+    send(page, playing_status(bridge, "/demo.svg", "New track"))
     expect(page.locator("#artwork")).to_have_attribute("src", "/demo.svg")
+    for route in pending:
+        with page.expect_event("requestfinished", lambda request: request.url.endswith(ART_ONE)):
+            route.fulfill(body=(Path(__file__).parents[1] / "bridge/web/demo.svg").read_bytes(), content_type="image/svg+xml")
+    # Give the late response many frames to (wrongly) replace the newer cover.
+    next_frames(page, 40)
+    expect(page.locator("#artwork")).to_have_attribute("src", "/demo.svg")
+    expect(page.locator("#covers .hero")).to_have_count(1)
     expect(page.locator("#title")).to_have_text("New track")
 
 
@@ -248,9 +298,14 @@ def test_late_artwork_cannot_replace_a_newer_track(bridge_page, bridge):
 ])
 def test_artwork_validation_rejects_nonlocal_or_malformed_content_ids(bridge_page, bridge, artwork):
     page = bridge_page
-    page.evaluate("value => window.testLogs.status(value)", playing_status(bridge, artwork))
-    expect(page.locator('#artwork')).to_have_attribute('src', '/placeholder.svg')
-    expect(page.locator('.ambience img.visible')).to_have_attribute('src', '/placeholder.svg')
+    requests = []
+    page.on("request", lambda request: requests.append(request.url))
+    send(page, playing_status(bridge, artwork))
+    expect(page.locator("#title")).to_have_text("Once Upon a Time In the West")
+    next_frames(page, 10)
+    expect(page.locator("#artwork")).to_have_count(0)
+    expect(page.locator("#covers .hero")).to_have_count(0)
+    assert not [url for url in requests if "art-" in url or "example.invalid" in url]
 
 
 @pytest.mark.parametrize("width,height", [(868, 695), (390, 640), (868, 500)])
@@ -259,52 +314,60 @@ def test_small_windows_fit_track_metadata_and_popups(bridge_page, bridge, width,
     page = bridge_page
     page.set_viewport_size({"width": width, "height": height})
     if font:
-        page.add_style_tag(content=f":root {{ font-family: {font}; }}")
+        page.add_style_tag(content=f"html, body, button, input {{ font-family: {font} !important; }}")
     value = playing_status(bridge, "/demo.svg")
     value["audio"].update(source_format="AAC/48000/F24/7.1", input_bitrate_bps=256000)
-    page.evaluate("value => window.testLogs.status(value)", value)
-    expect(page.locator("#codec")).to_have_text("ReceivedAAC · 7.1 · 48 kHz · — · 256 kbps")
-    expect(page.locator("#status-text")).to_have_text("AirPlay 2 · Playing")
-    expect(page.locator("#volume")).to_have_text("Volume · 25%")
+    send(page, value)
+    expect(page.locator("#codec")).to_have_text("AAC 7.1 · 48 kHz · 256 kbps")
+    expect(page.locator("#format")).to_have_text("FLAC Stereo · 48 kHz · 32-bit")
+    expect(page.locator("#room-label")).to_have_text("Playing on Example Speaker")
+    expect(page.locator("#volume")).to_have_text("25%")
+    assert page.locator("#tags .tag").all_text_contents() == ["7.1", "AAC"]
+    settled(page)
     page.wait_for_function("document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth", timeout=5000)
-    for selector in ("#title", "#artist", "#album", "#status", "#codec", "#format", "#volume"):
+    for selector in ("#title", "#artist", "#album", "#tags", "#room"):
         rect = page.locator(selector).bounding_box()
-        assert rect and rect["y"] >= 0 and rect["y"] + rect["height"] <= height
-    for name in ("Connection details", "Live logs"):
-        page.get_by_role("button", name="Open menu").click()
-        page.get_by_role("button", name=name, exact=True).click()
+        assert rect, selector
+        assert rect["x"] >= 0 and rect["x"] + rect["width"] <= width, selector
+        assert rect["y"] >= 0 and rect["y"] + rect["height"] <= height, selector
+    for name in ("Connection", "Logs"):
+        open_panel(page, name)
+        settled(page)
         panel = page.locator("#panel")
         rect = panel.bounding_box()
         assert rect["x"] >= 0 and rect["y"] >= 0
         assert rect["x"] + rect["width"] <= width and rect["y"] + rect["height"] <= height
         assert panel.evaluate("node => node.scrollWidth <= node.clientWidth")
-        page.get_by_role("button", name="Close panel").click()
+        assert page.locator(".panel-body").evaluate("node => node.scrollWidth <= node.clientWidth")
+        close_panel(page)
 
 
 def test_connection_recovers_without_duplicate_logs_and_resets_on_restart(log_page, bridge):
     page = log_page
     data = playing_status(bridge)
-    page.evaluate("value => window.testLogs.status(value)", data)
+    send(page, data)
     emit(page, 1, 2)
     page.evaluate("window.testLogs.disconnect()")
-    expect(page.locator("#status-text")).to_contain_text("Reconnecting")
+    expect(page.locator("#eyebrow")).to_be_visible()
+    expect(page.locator("#eyebrow")).to_contain_text("Reconnecting")
+    expect(page.locator("#title")).to_have_text("Can’t reach the bridge")
     expect(page.locator("#volume")).to_be_empty()
-    expect(page.locator("#issue")).to_be_visible()
+    expect(page.locator("#vol")).to_be_hidden()
     data["track"]["title"] = "Recovered track"
     page.evaluate("value => window.testLogs.reconnect(value)", data)
     expect(page.locator("#title")).to_have_text("Recovered track")
-    expect(page.locator("#issue")).to_be_hidden()
-    expect(page.locator("#log-state")).to_have_class("log-pulse")
+    expect(page.locator("#eyebrow")).to_be_hidden()
+    expect(page.locator("#log-state")).to_have_class(re.compile(r"\blog-pulse\b"))
     emit(page, 1, 3)
     expect(page.locator("#log-output > span")).to_have_count(3)
     data["instance"] = "restarted-backend"
-    page.evaluate("value => window.testLogs.status(value)", data)
+    send(page, data)
     expect(page.locator("#log-output > span")).to_have_count(0)
     emit(page, 1, 1)
     expect(page.locator("#log-output > span")).to_have_count(1)
 
 
-def test_keyboard_closes_popups_restores_focus_and_resumes_logs(log_page):
+def test_keyboard_closes_panel_restores_focus_and_resumes_logs(log_page):
     page = log_page
     emit(page, 1, 500)
     output = page.locator("#log-output")
@@ -318,19 +381,20 @@ def test_keyboard_closes_popups_restores_focus_and_resumes_logs(log_page):
     expect(badge).to_be_hidden()
     assert bottom_distance(page) <= 8
     page.keyboard.press("Escape")
-    expect(page.locator("#panel")).not_to_be_visible()
-    button = page.get_by_role("button", name="Open menu")
+    expect(page.locator("#panel")).to_be_hidden()
+    button = page.get_by_role("button", name="Show details", exact=True)
     expect(button).to_be_focused()
+    # Opening with the keyboard lands on the active tab; Escape hands focus back.
     button.press("Enter")
-    expect(page.get_by_role("button", name="Connection details", exact=True)).to_be_focused()
+    expect(page.locator("#panel")).to_be_visible()
+    expect(page.locator('.seg [aria-pressed="true"]')).to_be_focused()
     page.keyboard.press("Escape")
+    expect(page.locator("#panel")).to_be_hidden()
     expect(button).to_be_focused()
-    expect(page.locator("#menu")).to_be_hidden()
     button.press("Enter")
-    page.get_by_role("button", name="Connection details", exact=True).press("Enter")
     expect(page.locator("#panel")).to_be_visible()
     page.keyboard.press("Escape")
-    expect(page.locator("#panel")).not_to_be_visible()
+    expect(page.locator("#panel")).to_be_hidden()
     expect(button).to_be_focused()
 
 
@@ -338,6 +402,8 @@ def test_closed_sources_retry_with_backoff_and_recover(log_page, bridge):
     page = log_page
     page.clock.install()
     page.clock.pause_at(datetime.now() + timedelta(seconds=1))
+    # Refresh the page's stale-status watchdog against the fake clock.
+    send(page, playing_status(bridge))
     initial = page.evaluate('window.testLogs.count()')
     page.evaluate('window.testLogs.failClosedAttempts(2)')
     expect(page.locator('#log-state')).to_have_text('Reconnecting…')
@@ -355,8 +421,8 @@ def test_closed_sources_retry_with_backoff_and_recover(log_page, bridge):
     assert page.evaluate('window.testLogs.count()') == initial + 3
     expect(page.locator('#log-state')).to_have_text('Live')
     page.evaluate('value => window.testLogs.status(value)', playing_status(bridge))
-    expect(page.locator('#status-text')).to_have_text('AirPlay 2 · Playing')
-    expect(page.locator('#issue')).to_be_hidden()
+    expect(page.locator('#room-label')).to_have_text('Playing on Example Speaker')
+    expect(page.locator('#eyebrow')).to_be_hidden()
 
 
 def test_native_event_source_recovers_after_http_503(bridge_page, bridge):
@@ -374,13 +440,20 @@ def test_native_event_source_recovers_after_http_503(bridge_page, bridge):
 
     page.route('**/api/events*', events)
     page.evaluate('() => { window.EventSource = window.NativeEventSource; }')
-    page.get_by_role('button', name='Open menu').click()
-    page.get_by_role('button', name='Live logs', exact=True).click()
+    # fulfil() ends the successful stream at once, so the page can drop back to
+    # "Can’t reach the bridge" before a title is ever painted. Record every title
+    # the heading receives, with motion reduced so each one is written immediately.
+    page.emulate_media(reduced_motion='reduce')
+    page.evaluate("""() => {
+      window.titles = [];
+      new MutationObserver(() => window.titles.push(document.getElementById('title').textContent))
+        .observe(document.getElementById('title'), {childList: true, subtree: true, characterData: true});
+    }""")
+    open_panel(page, 'Logs')
     expect(page.locator('#log-state')).to_have_text('Reconnecting…')
-    expect(page.locator('#title')).to_have_text('Recovered after overload', timeout=5000)
-    # fulfill() ends the successful stream immediately. Receiving the new
-    # title proves recovery; EOF can legitimately return the UI to reconnecting.
+    page.wait_for_function("window.titles.includes('Recovered after overload')", timeout=8000)
     assert len(attempts) >= 2
+    assert 'logs=1' in attempts[0]
 
 
 def test_reconnected_log_sequence_jump_reports_expired_history(log_page):

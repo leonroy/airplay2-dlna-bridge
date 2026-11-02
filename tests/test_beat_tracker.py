@@ -59,6 +59,16 @@ def test_next_beat_counts_down_between_feeds(bridge):
     assert (first - later) % 0.5 == pytest.approx(0.1, abs=0.02)
 
 
+def test_playback_delay_moves_next_beat_later(bridge):
+    tracker = bridge.BeatTracker(bridge.PCMFormat(44100, "S16_LE", 2))
+    feed(tracker, click_track(120, 12))
+    now = tracker.fed_at
+    base = tracker.snapshot(now)["next_beat_in"]
+    delayed = tracker.snapshot(now, delay=0.1)["next_beat_in"]
+    assert (delayed - base) % 0.5 == pytest.approx(0.1, abs=0.01)
+    assert bridge.PULSE_DELAY == 5.0
+
+
 def test_no_pulse_until_enough_audio_or_for_silence(bridge):
     pcm = bridge.PCMFormat(44100, "S16_LE", 2)
     tracker = bridge.BeatTracker(pcm)

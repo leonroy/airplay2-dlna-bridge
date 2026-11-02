@@ -26,6 +26,8 @@ HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", "16"))
 FLAC_MAX_ENCODERS = int(os.environ.get("FLAC_MAX_ENCODERS", "4"))
 HTTP_HEADER_TIMEOUT = int(os.environ.get("HTTP_HEADER_TIMEOUT", "5"))
 HTTP_HEADER_DEADLINE = int(os.environ.get("HTTP_HEADER_DEADLINE", "10"))
+# The bridge hears audio before the speaker plays it; the page pulses this late.
+PULSE_DELAY = int(os.environ.get("PULSE_DELAY_MS", "5000")) / 1000
 if min(HTTP_MAX_CONNECTIONS, FLAC_MAX_ENCODERS,
        HTTP_HEADER_TIMEOUT, HTTP_HEADER_DEADLINE) <= 0:
     raise ValueError("HTTP/encoder limits and header timeouts must be positive integers")
@@ -302,12 +304,12 @@ class BeatTracker:
                 best_phase, best = phase, score
         return self.hops - 1 - best_phase
 
-    def snapshot(self, now=None):
+    def snapshot(self, now=None, delay=0.0):
         if self.period is None or self.confidence < self.MIN_CONFIDENCE or self.fed_at is None:
             return None
         now = time.monotonic() if now is None else now
         position = self.hops + (now - self.fed_at) / self.hop_seconds
-        next_beat = (self.beat_hop - position) % self.period
+        next_beat = ((self.beat_hop + delay / self.hop_seconds) - position) % self.period
         return {"bpm": round(60 / (self.period * self.hop_seconds), 1),
                 "confidence": round(self.confidence, 2),
                 "next_beat_in": round(next_beat * self.hop_seconds, 3),
@@ -1737,7 +1739,7 @@ def status_snapshot():
                  "receiver_stats": dict(AUDIO.receiver_stats) if AUDIO.receiver_stats is not None else None,
                  "airplay_version": {"Classic": 1, "Realtime": 2, "Buffered": 2}.get(AUDIO.stream_type),
                  "age_seconds": round(now - AUDIO.started, 1) if AUDIO.started is not None else None,
-                 "pulse": AUDIO.beat.snapshot(now) if AUDIO.beat else None,
+                 "pulse": AUDIO.beat.snapshot(now, delay=PULSE_DELAY) if AUDIO.beat else None,
                  "format": pcm, "pending_bytes": len(AUDIO.pending), "buffered_bytes": 0,
                  "raw_bytes": AUDIO.raw_bytes, "discarded_bytes": AUDIO.discarded_bytes}
         if AUDIO.ring is not None:
