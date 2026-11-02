@@ -54,13 +54,13 @@
           <ol class="path" id="path" data-s>
             <li><span class="node"></span><span class="wire"></span><small>Received from AirPlay</small><div class="value" id="codec"></div></li>
             <li><span class="node"></span><span class="wire"></span><small>Sent by the bridge</small><div class="value" id="format"></div></li>
-            <li id="path-room-row"><span class="node"></span><small>Playing on</small><div class="value" id="path-room"><b></b> <span></span></div></li>
+            <li id="path-room-row"><span class="node"></span><small>Speaker</small><div class="value" id="path-room"><b></b> <span></span></div></li>
           </ol>
-          <div class="chart" id="bitrate-chart" data-s hidden>
-            <div class="chart-stats">
-              <div><p class="stat-label">Input bitrate</p><p class="stat-value"><b id="bitrate-now"></b><small>kbps</small></p></div>
+          <div class="chart-stats" id="audio-stats" data-s hidden>
+              <div id="bitrate-stat" hidden><p class="stat-label">Input bitrate</p><p class="stat-value"><b id="bitrate-now"></b><small>kbps</small></p></div>
               <div id="tempo-stat" hidden><p class="stat-label">Tempo</p><p class="stat-value"><b id="tempo-now"></b><small>BPM</small><span class="beat-mark" id="beat-mark" aria-hidden="true"></span></p></div>
-            </div>
+          </div>
+          <div class="chart" id="bitrate-chart" data-s hidden>
             <div class="trace">
               <svg id="bitrate-history" viewBox="0 0 100 56" preserveAspectRatio="none" role="img" aria-label="Input bitrate over the last 60 seconds" data-count="0" data-stale="false"><g id="bitrate-glide"><path id="bitrate-line" d="" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></path></g></svg>
               <span class="trace-dot" id="trace-dot" aria-hidden="true"></span>

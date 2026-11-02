@@ -12,6 +12,11 @@
   let logConnection = demo ? "Demo" : "Connecting…";
   const encoder = new TextEncoder();
   const labels = { idle: "Ready for AirPlay", receiving: "Receiving AirPlay", waiting: "Waiting for audio format", error: "Audio session error" };
+  const SPEAKER_STATES = {
+    PLAYING: { label: "Playing on ", active: true }, PAUSED_PLAYBACK: { label: "Paused on ", held: true },
+    STOPPED: { label: "Stopped on ", held: true }, NO_MEDIA_PRESENT: { label: "Nothing playing on ", held: true },
+    TRANSITIONING: { label: "Starting on " }
+  };
   const playbackLabels = { PLAYING: "Playing", PAUSED_PLAYBACK: "Paused", STOPPED: "Stopped", TRANSITIONING: "Starting", NO_MEDIA_PRESENT: "No media" };
   // Status fields such as failed=False are ordinary lines, so only real failures count.
   const ISSUE = /\b(error|errors|rejected|timed out|timeout|exceeded|lost)\b|\bfailed\b(?!=False)/i;
@@ -76,6 +81,8 @@
     const latest = bitrateHistory.at(-1), chart = $("bitrate-chart"), svg = $("bitrate-history");
     const shown = !!latest && snapshot?.audio.state !== "idle";
     chart.hidden = !shown;
+    $("bitrate-stat").hidden = !shown;
+    $("audio-stats").hidden = !shown && $("tempo-stat").hidden;
     svg.dataset.count = bitrateHistory.length;
     if (!latest) { drawnAt = 0; return; }
     const first = bitrateHistory[0], age = Math.max(0, (Date.now() - latest.at) / 1000);
@@ -225,13 +232,16 @@
     if (recipient.configured && (recipient.playback.error === "connection" || recipient.volume.error === "connection"))
       return problem("speaker", "Playback interrupted", `${Target} isn’t responding`, "Audio is still reaching the bridge. Check that the speaker is on and connected to your network.");
     const stale = recipient.configured && recipient.playback.stale;
-    const paused = recipient.configured && !stale && recipient.playback.value === "PAUSED_PLAYBACK";
+    // Audio reaching the bridge says nothing about the speaker, so only its reported state counts.
+    // A speaker with no usable report may still be playing, so that wording stays neutral.
+    const speaker = recipient.configured && !stale ? SPEAKER_STATES[recipient.playback.value] : null;
+    const held = !!speaker?.held, active = !speaker || speaker.active;
     const known = !!track.title;
     const title = known ? track.title : "Track information unavailable";
-    const label = stale ? `${Target} status is out of date` : !recipient.configured ? "Receiving AirPlay" : `${paused ? "Paused" : "Playing"} on ${target}`;
-    return { ...base, mode: "track", key: "track", title, artist: known ? track.artist || "" : "AirPlay audio", album: known ? track.album || "" : "", look: paused ? "paused" : "", label, warn: stale, paused,
-      volume: fresh ? recipient.volume.value : null, tags: true, rest: !paused && !stale,
-      live: stale ? label : paused ? `Paused: ${title}` : known ? `Playing ${title}` : "Playing AirPlay audio", audioInfo: audioInfo(data, target) };
+    const label = stale ? `${Target} status is out of date` : !recipient.configured ? "Receiving AirPlay" : speaker ? `${speaker.label}${target}` : `Sending to ${target}`;
+    return { ...base, mode: "track", key: "track", title, artist: known ? track.artist || "" : "AirPlay audio", album: known ? track.album || "" : "", look: held ? "paused" : "", label, warn: stale, active,
+      volume: fresh ? recipient.volume.value : null, tags: true, rest: active && !stale,
+      live: stale || !recipient.configured || !speaker?.active ? `${label}: ${title}` : known ? `Playing ${title}` : "Playing AirPlay audio", audioInfo: audioInfo(data, target) };
   }
 
   /* ---------- Colour field and cover ---------- */
@@ -596,7 +606,7 @@
     if (wakeKey !== `${m.mode}${m.rest}`) { wakeKey = `${m.mode}${m.rest}`; wake(); }
     if ($("live").textContent !== m.live) $("live").textContent = m.live;
     renderAudio(m);
-    readPulse(data?.audio.pulse, m.mode === "track" && !m.paused);
+    readPulse(data?.audio.pulse, m.mode === "track" && m.active);
     if (!booted) { rise($("room"), 980, 12); booted = true; }
   }
 

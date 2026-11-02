@@ -191,6 +191,7 @@ class BeatTracker:
     MIN_BPM, MAX_BPM = 70, 180
     MIN_CONFIDENCE = 0.12
     SILENCE = 0.002
+    MAX_GAP_SECONDS = 1.0
 
     def __init__(self, pcm):
         self.channels = pcm.channels
@@ -201,6 +202,9 @@ class BeatTracker:
         self.hop_seconds = self.hop_frames / pcm.rate
         self.hop_bytes = self.hop_frames * self.frame
         self.stride = max(2, pcm.rate // 4000)
+        if self.width > 1 and self.stride * self.frame % 2:
+            # Samples are read as 16-bit values, so the step must be a whole number of them.
+            self.stride += 1
         self.partial = bytearray()
         self.onsets = collections.deque(maxlen=int(self.WINDOW_SECONDS / self.hop_seconds))
         self.floor = self.loudness = self.peak = 0.0
@@ -227,6 +231,11 @@ class BeatTracker:
         return total / count if count else 0.0
 
     def feed(self, data):
+        if self.fed_at is not None and time.monotonic() - self.fed_at > self.MAX_GAP_SECONDS:
+            # After a gap, the old rhythm says nothing about the audio that follows.
+            self.onsets.clear()
+            self.period = self.beat_hop = None
+            self.confidence = 0.0
         self.partial.extend(data)
         offset = 0
         while len(self.partial) - offset >= self.hop_bytes:
@@ -308,6 +317,9 @@ class BeatTracker:
         if self.period is None or self.confidence < self.MIN_CONFIDENCE or self.fed_at is None:
             return None
         now = time.monotonic() if now is None else now
+        # The speaker keeps playing buffered audio for the delay after the last PCM arrives.
+        if now - self.fed_at > self.MAX_GAP_SECONDS + delay:
+            return None
         position = self.hops + (now - self.fed_at) / self.hop_seconds
         next_beat = ((self.beat_hop + delay / self.hop_seconds) - position) % self.period
         return {"bpm": round(60 / (self.period * self.hop_seconds), 1),

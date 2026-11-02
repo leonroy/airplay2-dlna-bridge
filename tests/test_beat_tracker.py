@@ -137,3 +137,45 @@ def test_analysis_failure_cannot_interrupt_audio(bridge):
     stream.feed(bytes(4096))
     assert stream.pcm_bytes == 8192
     stream.end()
+
+
+@pytest.mark.parametrize("rate", [22050, 44100])
+def test_odd_sampling_steps_stay_on_sample_boundaries(bridge, rate):
+    # Only low-order bytes are set, so this is near silence unless samples are misread.
+    frames = bytearray(rate * 12 * 3)
+    for beat in range(24):
+        start = int(beat * 0.5 * rate)
+        for index in range(int(0.05 * rate)):
+            frames[(start + index) * 3] = 200
+    tracker = bridge.BeatTracker(bridge.PCMFormat(rate, "S24_3LE", 1))
+    feed(tracker, bytes(frames), chunk=8190)
+    assert tracker.stride * tracker.frame % 2 == 0
+    assert tracker.snapshot(tracker.fed_at) is None
+
+
+def test_24_bit_mono_at_44100_finds_the_tempo(bridge):
+    source = struct.unpack(f"<{44100 * 12 * 2}h", click_track(120, 12))[::2]
+    tracker = bridge.BeatTracker(bridge.PCMFormat(44100, "S24_3LE", 1))
+    feed(tracker, b"".join(b"\0" + struct.pack("<h", value) for value in source), chunk=8190)
+    assert tracker.snapshot(tracker.fed_at)["bpm"] == pytest.approx(120, rel=0.02)
+
+
+def test_pulse_expires_when_pcm_stops(bridge):
+    tracker = bridge.BeatTracker(bridge.PCMFormat(44100, "S16_LE", 2))
+    feed(tracker, click_track(120, 12))
+    assert tracker.snapshot(tracker.fed_at + 0.5)
+    assert tracker.snapshot(tracker.fed_at + 1.5) is None
+    assert tracker.snapshot(tracker.fed_at + 60) is None
+    # The speaker is still playing buffered audio during the delay.
+    assert tracker.snapshot(tracker.fed_at + 5.5, delay=5.0)
+    assert tracker.snapshot(tracker.fed_at + 6.5, delay=5.0) is None
+
+
+def test_tracker_relocks_when_audio_resumes_after_a_gap(bridge):
+    tracker = bridge.BeatTracker(bridge.PCMFormat(44100, "S16_LE", 2))
+    feed(tracker, click_track(120, 12))
+    tracker.fed_at -= 5
+    feed(tracker, click_track(120, 1))
+    assert tracker.snapshot(tracker.fed_at) is None
+    feed(tracker, click_track(96, 12))
+    assert tracker.snapshot(tracker.fed_at)["bpm"] == pytest.approx(96, rel=0.02)

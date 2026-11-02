@@ -1,5 +1,6 @@
 """The redesigned status page: quality tags, states, pulse, logs, resting and panel behaviour."""
 from datetime import datetime, timedelta
+import re
 
 import pytest
 
@@ -155,6 +156,64 @@ def test_pulse_shows_tempo_and_lights_the_beat_then_settles(bridge_page, bridge)
     expect(page.locator("#tempo-stat")).to_be_hidden()
     page.wait_for_function(RESET, timeout=8000)
     assert page.evaluate(BEAT) == 0
+
+
+@pytest.mark.parametrize("source", ["PCM/48000/S16_LE/2", "AAC/48000/F24/2"])
+def test_tempo_shows_without_bitrate_readings(bridge_page, bridge, source):
+    page = bridge_page
+    data = pulsing(bridge)
+    data["audio"].update(input_bitrate_bps=None, source_format=source, codec=source[:source.index("/")])
+    send(page, data)
+    page.locator("#tags").click()
+    expect(page.locator("#tempo-stat")).to_be_visible()
+    expect(page.locator("#tempo-now")).to_have_text("120")
+    expect(page.locator("#bitrate-chart")).to_be_hidden()
+    expect(page.locator("#bitrate-stat")).to_be_hidden()
+    data["audio"]["pulse"] = None
+    send(page, data)
+    expect(page.locator("#audio-stats")).to_be_hidden()
+
+
+@pytest.mark.parametrize("state,label,dimmed", [
+    ("STOPPED", "Stopped on Example Speaker", True),
+    ("NO_MEDIA_PRESENT", "Nothing playing on Example Speaker", True),
+    ("TRANSITIONING", "Starting on Example Speaker", False),
+])
+def test_speaker_not_playing_is_never_reported_as_playing(bridge_page, bridge, state, label, dimmed):
+    page = bridge_page
+    data = pulsing(bridge)
+    data["track"]["artwork"] = "/demo.svg"
+    send(page, data)
+    expect(page.locator("#artwork")).to_have_count(1)
+    page.wait_for_function(f"{BEAT} > 0", timeout=8000)
+    data["recipient"]["playback"]["value"] = state
+    send(page, data)
+    expect(page.locator("#room-label")).to_have_text(label)
+    page.wait_for_function(RESET, timeout=8000)
+    expect(page.locator("#live")).not_to_contain_text("Playing ")
+    assert page.locator("#covers .hero").last.evaluate("node => node.classList.contains('paused')") == dimmed
+    # Controls must stay available: nothing here is safe to fade away.
+    page.clock.install()
+    page.mouse.move(40, 40)
+    page.clock.run_for(9000)
+    expect(page.locator("#stage")).not_to_have_class(re.compile(r"\brest\b"))
+    data["recipient"]["playback"]["value"] = "PLAYING"
+    send(page, data)
+    expect(page.locator("#room-label")).to_have_text("Playing on Example Speaker")
+
+
+@pytest.mark.parametrize("change", [
+    lambda playback: playback.update(value=None, at=None),
+    lambda playback: playback.update(value=None, error="unavailable"),
+    lambda playback: playback.update(value="SOMETHING_NEW"),
+])
+def test_unknown_speaker_state_is_worded_neutrally(bridge_page, bridge, change):
+    page = bridge_page
+    data = pulsing(bridge)
+    change(data["recipient"]["playback"])
+    send(page, data)
+    expect(page.locator("#room-label")).to_have_text("Sending to Example Speaker")
+    expect(page.locator("#live")).not_to_contain_text("Playing ")
 
 
 def test_pulse_stops_when_playback_pauses(bridge_page, bridge):
