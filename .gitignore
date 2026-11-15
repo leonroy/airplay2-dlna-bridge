@@ -29,3 +29,6 @@ dist/
 .tools/
 .release-preview/
 CHANGELOG.md
+
+# Repository-local Git worktrees
+/.worktrees/
